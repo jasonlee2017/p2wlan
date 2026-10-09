@@ -1,0 +1,149 @@
+name: Path State Machine
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/path-state-machine-required.yml"
+      - ".github/workflows/nat-topology-gate.yml"
+      - ".github/workflows/windows-lifecycle.yml"
+      - ".github/workflows/mobile-lifecycle.yml"
+      - "client/daemon/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: read
+  actions: read
+
+concurrency:
+  # A commit validation (push / pull_request) and a periodic health check
+  # (schedule / workflow_dispatch) are different obligations for the same
+  # ref. Sharing one concurrency group let a scheduled run cancel an
+  # in-flight commit validation, so each event class gets its own group and
+  # only a pull request cancels its own superseded predecessors.
+  group: path-state-machine-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust_required:
+    name: Path state machine Rust checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux workspace dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+
+      - name: Cargo format
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Cargo workspace tests except Hard-Hard E2E
+        env:
+          RUST_TEST_THREADS: "1"
+        run: cargo test --workspace -- --test-threads=1 --skip hard_hard_
+
+      - name: Hard-Hard E2E tests
+        run: cargo test -p p2wlan-daemon --lib hard_hard_ -- --test-threads=1
+
+  windows_path_state_machine:
+    name: Path state machine Windows tests
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Run reducer and generation-fence tests
+        run: cargo test -p p2wlan-daemon --lib path_state_machine -- --test-threads=1
+
+      - name: Run late Direct ACK lifecycle test
+        run: cargo test -p p2wlan-daemon --lib transport::tests::old_generation_validation_ack_cannot_promote_or_adopt_affinity -- --exact --test-threads=1
+
+      - name: Run authenticated Direct endpoint drift test
+        run: cargo test -p p2wlan-daemon --lib transport::tests::authenticated_validation_ack_endpoint_drift_promotes_observed_endpoint -- --exact --test-threads=1
+
+      - name: Run Relay incarnation test
+        run: cargo test -p p2wlan-daemon --lib tests::daemon_e2e::network_outbound::test_relay_probe_same_endpoint_replacement_rejects_old_transport_ack -- --exact --test-threads=1
+
+      - name: Run PeerLeft adoption fence test
+        run: cargo test -p p2wlan-daemon --lib udp::tests::peer_left_cleanup_linearizes_with_late_ack -- --exact --test-threads=1
+
+      - name: Run initiator publish lock-order test
+        run: cargo test -p p2wlan-daemon --lib tests::daemon_e2e::handshake_contention::initiator_publish_releases_epoch_while_connection_writer_is_contended -- --exact --test-threads=1
+
+      - name: Run committed-path wake under diagnostics contention test
+        run: cargo test -p p2wlan-daemon --lib overlay_validate_tests::committed_path_notification_and_snapshot_bypass_stale_diagnostics -- --exact --test-threads=1
+
+      - name: Run strict-Direct echo commit-order test
+        run: cargo test -p p2wlan-daemon --lib overlay_validate_tests::strict_direct_echo_waits_for_local_direct_commit_without_sleep -- --exact --test-threads=1
+
+  lifecycle_and_topology_gates:
+    name: Existing lifecycle and topology gates
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require same-SHA NAT, Windows, and Mobile gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Untrusted event data must reach the shell through a validated env
+          # value, never by direct interpolation.
+          P2WLAN_GATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 scripts/quality/check_required_gates.py \
+            --sha "$P2WLAN_GATE_HEAD_SHA" \
+            --require "NAT Topology Required" \
+            --require "Windows Lifecycle Required" \
+            --require "Mobile Lifecycle Required" \
+            --timeout-seconds 3000
+  required:
+    name: Path State Machine Required
+    if: always()
+    needs:
+      - rust_required
+      - windows_path_state_machine
+      - lifecycle_and_topology_gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce aggregate results
+        env:
+          RUST_RESULT: ${{ needs.rust_required.result }}
+          WINDOWS_RESULT: ${{ needs.windows_path_state_machine.result }}
+          EXTERNAL_RESULT: ${{ needs.lifecycle_and_topology_gates.result }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          test "$RUST_RESULT" = "success"
+          test "$WINDOWS_RESULT" = "success"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            test "$EXTERNAL_RESULT" = "success"
+          else
+            test "$EXTERNAL_RESULT" = "skipped"
+          fi

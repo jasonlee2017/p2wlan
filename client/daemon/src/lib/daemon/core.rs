@@ -1,0 +1,448 @@
+#[cfg(test)]
+type ResponderPostAnswerTestGateSlot =
+    Arc<std::sync::Mutex<Option<(String, Arc<ResponderPostAnswerTestGate>)>>>;
+
+#[cfg(test)]
+type CandidatePostprocessTestGateSlot =
+    Arc<std::sync::Mutex<Option<(String, Arc<CandidatePostprocessTestGate>)>>>;
+
+/// Deterministically pauses a candidate owner after its candidate transaction
+/// commits and before deferred punch preparation starts.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct CandidatePostprocessTestGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Barrier,
+    pub(crate) completed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl CandidatePostprocessTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Barrier::new(2),
+            completed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+/// The main daemon orchestrator.
+///
+/// Holds all subsystems and coordinates their lifecycle.
+pub struct Daemon {
+    /// Configuration.
+    config: Arc<Config>,
+    /// Control plane client.
+    control: ControlClient,
+    /// Control event receiver.
+    control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlEvent>,
+    /// Peer connection manager.
+    peers: Arc<PeerManager>,
+    /// Shared WireGuard transport session adapter.
+    transport: WireGuardTransport,
+    /// RAW routed outbound packets emitted by the WireGuard adapter to the
+    /// network outbound worker (which is the only place that encrypts
+    /// business packets).
+    outbound_rx: Option<mpsc::Receiver<OutboundPacket>>,
+    /// In-flight initiator handshakes keyed by responder node ID (shared so timeout tasks can clean up).
+    pending_handshakes: Arc<PendingHandshakeStore>,
+    /// Serializes offer, answer, and maintenance mutations for one peer.
+    handshake_arbiter: HandshakeArbiter,
+    #[cfg(test)]
+    responder_post_answer_test_gate: ResponderPostAnswerTestGateSlot,
+    #[cfg(test)]
+    candidate_postprocess_test_gate: CandidatePostprocessTestGateSlot,
+    /// Local UDP candidate endpoints advertised in signaling messages.
+    local_candidates: Arc<RwLock<Vec<String>>>,
+    /// Local-only source metadata keyed by candidate endpoint string.
+    local_candidate_sources: Arc<RwLock<HashMap<String, String>>>,
+    /// Stable physical/public identity used for network-generation changes.
+    local_network_identity: Arc<RwLock<Vec<String>>>,
+    /// Serializes candidate gathering/commit so endpoints, sources, identity,
+    /// and generation advance as one coherent snapshot.
+    candidate_refresh_lock: Arc<Mutex<()>>,
+    /// Shared candidate snapshot lease: within its TTL no signaling path may
+    /// re-run a live STUN gather (single-flight); expired snapshots are still
+    /// used as a bounded old snapshot so a slow refresh never blocks an
+    /// answer/offer.
+    candidate_snapshot: Arc<RwLock<Option<CandidateSnapshotLease>>>,
+    /// Per-peer offer-ingress dedup / rate-limit records.  Decided BEFORE any
+    /// candidate-plane state is touched, so repeated/old offers from a
+    /// churning peer cannot trigger candidate applies or fresh transactions.
+    offer_ingress: Arc<std::sync::Mutex<HashMap<String, OfferIngressRecord>>>,
+    /// Latest local NAT behavior profile inferred from STUN observations.
+    nat_profile: Arc<RwLock<Option<NatProfile>>>,
+    /// Cached gateway mapping lifecycle and structured diagnostics.
+    gateway_mapping_runtime: Arc<RwLock<GatewayMappingRuntime>>,
+    gateway_mapping_diagnostics: Arc<RwLock<GatewayMappingDiagnostics>>,
+    /// Coordinates UDP punch bursts across all trigger paths.
+    punch_attempts: PunchAttemptDeduplicator,
+    /// Bound UDP transport shared with control-plane-triggered punching.
+    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    /// Authoritative UDP transport publication stream.  The legacy RwLock is
+    /// retained for existing best-effort consumers; WireGuard inbound uses
+    /// this watch-backed slot so it follows delayed publication and replacement.
+    udp_transport_publication: UdpTransportPublication,
+    /// Resolved STUN / observer endpoints used by live candidate refreshes.
+    runtime_stun_servers: Arc<RwLock<Vec<SocketAddr>>>,
+    /// Timeout for runtime STUN refreshes.
+    runtime_stun_timeout: Arc<RwLock<Duration>>,
+    /// Relay transport used when direct UDP is unavailable.
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    /// Latest relay candidate selection diagnostics.
+    relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
+    /// Port mapping manager.
+    port_mappings: Arc<PortMappingManager>,
+    /// DNS resolver.
+    dns: Arc<DnsResolver>,
+    /// ACL engine.
+    acl: Arc<RwLock<AclEngine>>,
+    /// Route table manager.
+    route_manager: Arc<route::RouteManager>,
+    /// Shared health state for diagnostics / supervision.
+    health: Arc<tasks::HealthState>,
+    /// Task manager for spawning and supervising background tasks.
+    task_manager: Arc<tasks::TaskManager>,
+    /// Shutdown signal sender (true = shut down).
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Shutdown signal receiver cloned into background tasks.
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Persistent monotonic daemon incarnation.  Fresh-mapping prediction
+    /// labels embed this as the incarnation epoch (`predicted_fresh:<boot>:<gen>`)
+    /// and candidate generations embed it in their high bits: a restarted
+    /// daemon always supersedes every generation an older incarnation sent,
+    /// regardless of wall-clock rollback or a restart within the same
+    /// millisecond, and old incarnations' late signals can never win again.
+    boot_epoch_ms: u64,
+    /// Per-process connection timeline (correlation id + bounded event ring).
+    timeline: Arc<ConnectionTimeline>,
+    /// Bounded monotonic status event log backing the diagnostics `/events`
+    /// endpoint and the `/status.revision` counter. The timeline mirrors every
+    /// record into it.
+    status_events: Arc<crate::diagnostics::StatusEventBus>,
+    /// Watch for relay transport availability.  The relay supervisor flips this
+    /// whenever the shared `relay_transport` slot is set or cleared, so the
+    /// outbound path can wait event-driven for a relay to come up instead of
+    /// polling at a fixed interval.
+    relay_available_tx: watch::Sender<bool>,
+    /// Shared event edge for forced Relay probing and encrypted-session
+    /// maintenance. Relay availability and authenticated data-plane activity
+    /// bump this edge so a missing encrypted session is reconsidered promptly.
+    path_setup_kick_tx: watch::Sender<u64>,
+    /// Commit-before-wake edge for exact initiator preparation/publication
+    /// retries.  The serial control owner consumes it; maintenance periodically
+    /// republishes the current revision as a lost-wakeup backstop.
+    handshake_retry_kick_tx: watch::Sender<u64>,
+    /// Android's VpnService establishes the TUN before the Rust daemon starts.
+    #[cfg(target_os = "android")]
+    android_tun_fd: Option<std::os::fd::RawFd>,
+    /// Android TUN I/O experiment selected by the VpnService request.
+    #[cfg(target_os = "android")]
+    android_tun_mode: AndroidTunMode,
+    /// Set by the Android JNI bridge once the daemon has completed control
+    /// registration, attached the supplied TUN, and started its core tasks.
+    /// The JNI launch acknowledgement must not be confused with this state:
+    /// the former only means a runtime thread exists, while this flag means
+    /// the VPN dataplane is actually ready for diagnostics traffic.
+    #[cfg(target_os = "android")]
+    android_startup_ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Incarnation assigned by the Android JNI runtime owner. This is
+    /// additive diagnostics identity; desktop daemons continue without it.
+    #[cfg(target_os = "android")]
+    android_runtime_incarnation: Option<u64>,
+    /// Dedicated receivers stay alive from JNI startup through worker spawn,
+    /// so a callback that arrives during daemon setup is queued instead of
+    /// being dropped before direct/relay supervisors subscribe.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    android_network_change_direct_rx: Option<AndroidNetworkChangeReceiver>,
+    android_network_change_relay_rx: Option<AndroidNetworkChangeReceiver>,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    android_network_change_control_rx: Option<AndroidNetworkChangeReceiver>,
+}
+
+impl Daemon {
+    /// Create a new daemon from config.
+    pub fn new(config: Config) -> Self {
+        let control_enabled = !config.network.manual;
+        let config_path = config.config_path.clone();
+        let relay_selection = Arc::new(RwLock::new(RelaySelectionDiagnostics::default()));
+        // The fresh-mapping prediction incarnation epoch: a persistent
+        // strictly-monotonic counter (seeded from the wall clock only on the
+        // very first boot).  A restarted daemon's label supersedes every label
+        // an older incarnation sent even when the wall clock rolled back or
+        // the restart landed within the same millisecond, and the receiver's
+        // high-water keeps older incarnations' late signals out.
+        //
+        // Zero means no trustworthy incarnation exists for this boot (missing
+        // config path, corrupt or unreadable state file, version mismatch,
+        // unwritable state directory, or the counter exhausted): fresh-mapping
+        // prediction is disabled rather than silently re-seeded from the wall
+        // clock, which could regress below the high-water receivers recorded.
+        let boot_epoch_ms =
+            crate::incarnation::take_prepared_or_next_boot_incarnation(&config).unwrap_or(0);
+        // An incarnation that outgrew the 41-bit candidate-generation
+        // encoding field also disables fresh prediction (the label must never
+        // wrap): ordinary signaling continues with the legacy generation 0.
+        let boot_epoch_ms =
+            if crate::control::incarnation_fits_candidate_generation_encoding(boot_epoch_ms) {
+                boot_epoch_ms
+            } else {
+                0
+            };
+        if boot_epoch_ms == 0 {
+            warn!(
+                "Fresh-mapping prediction is disabled for this boot (no trustworthy persistent incarnation or the incarnation outgrew its encoding field); ordinary punching continues"
+            );
+        }
+        let timeline = ConnectionTimeline::new(&config.node.node_id, boot_epoch_ms);
+        // Construct health before the control runtime so successful polls can
+        // refresh it directly.  The main control-event consumer is allowed to
+        // spend time on a peer/UDP handover and must not be the only writer of
+        // the control-plane heartbeat timestamp.
+        let health = tasks::HealthState::new();
+        let punch_attempts = PunchAttemptDeduplicator::default();
+        let peers = Arc::new(PeerManager::new(config.clone()));
+        let (control, control_rx) = ControlClient::new_with_health(
+            &config,
+            control_enabled,
+            config_path,
+            Some(relay_selection.clone()),
+            timeline.clone(),
+            Some(health.clone()),
+            Some(peers.telemetry_hub()),
+        );
+        let (transport, outbound_rx) = WireGuardTransport::new();
+        let acl_engine = AclEngine::from_config(&config.acl);
+        let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
+
+        let task_manager = tasks::TaskManager::new(health.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Status event bus: bounded monotonic log backing `/events` and the
+        // `/status.revision` counter. Attach it to the shared timeline so every
+        // existing timeline emit is mirrored without touching each call site.
+        let status_events = crate::diagnostics::StatusEventBus::new();
+        timeline.set_status_event_bus(status_events.clone());
+
+        let udp_transport = Arc::new(RwLock::new(None));
+        let (relay_available_tx, _relay_available_rx) = tokio::sync::watch::channel(false);
+        let (path_setup_kick_tx, _path_setup_kick_rx) = tokio::sync::watch::channel(0u64);
+        let (handshake_retry_kick_tx, _handshake_retry_kick_rx) = tokio::sync::watch::channel(0u64);
+
+        // Register the punch-session canceller on the peer manager so a
+        // stale/404 quarantined peer's in-flight recovery session is
+        // cancelled authoritatively (the daemon's own `punch_attempts` is
+        // the same deduplicator the daemon hands to the punch tasks).
+        let pending_handshakes = Arc::new(PendingHandshakeStore::default());
+        peers.set_timeline(timeline.clone());
+        transport.set_outbound_loss_context(&peers, timeline.clone());
+        // Share ONE outbound-loss counter map between the peer manager (worker
+        // drops) and the transport (session-not-ready queue drops) so
+        // `/status.stats.outbound_drops` / `outbound_send_failures` report
+        // every loss source in one place.
+        let outbound_loss = Arc::new(tokio::sync::Mutex::new(
+            crate::peer::OutboundLossCounters::default(),
+        ));
+        peers.set_outbound_loss_sink(outbound_loss.clone());
+        transport.set_outbound_loss_sink(Some(outbound_loss));
+        {
+            let punch_attempts = punch_attempts.clone();
+            peers.set_punch_cancel_hook(Arc::new(move |peer_id| {
+                punch_attempts.cancel(peer_id);
+            }));
+        }
+        {
+            let pending_handshakes = pending_handshakes.clone();
+            let timeline = timeline.clone();
+            let timing_control = control.clone();
+            peers.set_network_generation_handshake_cancel_hook(Arc::new(move |generation| {
+                timing_control.invalidate_network_timing();
+                let (cancelled_reservations, cancelled_pending, stale_probe_bindings) =
+                    pending_handshakes
+                    .lock()
+                    .cancel_before_network_generation(generation);
+                if cancelled_reservations > 0 || cancelled_pending > 0 {
+                    timeline.emit(
+                        "handshake_reservations_cancelled_for_generation",
+                        None,
+                        Some("network_generation_advanced"),
+                        Some(format!(
+                            "generation={generation} cancelled_reservations={cancelled_reservations} cancelled_pending={cancelled_pending}"
+                        )),
+                    );
+                }
+                (
+                    cancelled_reservations,
+                    cancelled_pending,
+                    stale_probe_bindings,
+                )
+            }));
+        }
+
+        Self {
+            config: Arc::new(config.clone()),
+            control,
+            control_rx,
+            peers,
+            transport,
+            outbound_rx: Some(outbound_rx),
+            pending_handshakes,
+            handshake_arbiter: HandshakeArbiter::new(timeline.clone()),
+            #[cfg(test)]
+            responder_post_answer_test_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            candidate_postprocess_test_gate: Arc::new(std::sync::Mutex::new(None)),
+            local_candidates: Arc::new(RwLock::new(Vec::new())),
+            local_candidate_sources: Arc::new(RwLock::new(HashMap::new())),
+            local_network_identity: Arc::new(RwLock::new(Vec::new())),
+            candidate_refresh_lock: Arc::new(Mutex::new(())),
+            candidate_snapshot: Arc::new(RwLock::new(None)),
+            offer_ingress: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            nat_profile: Arc::new(RwLock::new(None)),
+            gateway_mapping_runtime: Arc::new(RwLock::new(GatewayMappingRuntime::default())),
+            gateway_mapping_diagnostics: Arc::new(RwLock::new(GatewayMappingDiagnostics {
+                enabled: config.network.upnp_enabled,
+                lease_seconds: PORT_MAPPING_LEASE_SECS,
+                ..GatewayMappingDiagnostics::default()
+            })),
+            punch_attempts,
+            udp_transport: udp_transport.clone(),
+            udp_transport_publication: UdpTransportPublication::new(udp_transport),
+            runtime_stun_servers: Arc::new(RwLock::new(Vec::new())),
+            runtime_stun_timeout: Arc::new(RwLock::new(Duration::from_millis(
+                config.network.stun_timeout_ms,
+            ))),
+            relay_transport: Arc::new(RwLock::new(None)),
+            relay_selection,
+            port_mappings: Arc::new(PortMappingManager::new()),
+            dns: Arc::new(DnsResolver::new(config.dns.clone())),
+            acl: Arc::new(RwLock::new(acl_engine)),
+            route_manager,
+            health,
+            task_manager,
+            shutdown_tx,
+            shutdown_rx,
+            boot_epoch_ms,
+            timeline,
+            status_events,
+            relay_available_tx,
+            path_setup_kick_tx,
+            handshake_retry_kick_tx,
+            #[cfg(target_os = "android")]
+            android_tun_fd: None,
+            #[cfg(target_os = "android")]
+            android_tun_mode: AndroidTunMode::AsyncFd,
+            #[cfg(target_os = "android")]
+            android_startup_ready: None,
+            #[cfg(target_os = "android")]
+            android_runtime_incarnation: None,
+            android_network_change_direct_rx: None,
+            android_network_change_relay_rx: None,
+            android_network_change_control_rx: None,
+        }
+    }
+
+    /// Construct a daemon around the fd owned by Android's VpnService.
+    #[cfg(target_os = "android")]
+    pub fn new_with_android_tun(config: Config, tun_fd: std::os::fd::RawFd) -> Self {
+        Self::new_with_android_tun_mode(config, tun_fd, AndroidTunMode::AsyncFd)
+    }
+
+    /// Construct a daemon around an Android VpnService fd and an explicit TUN
+    /// experiment mode. The default constructor above remains the stable
+    /// AsyncFd behavior for all existing callers.
+    #[cfg(target_os = "android")]
+    pub fn new_with_android_tun_mode(
+        config: Config,
+        tun_fd: std::os::fd::RawFd,
+        mode: AndroidTunMode,
+    ) -> Self {
+        let mut daemon = Self::new(config);
+        daemon.android_tun_fd = Some(tun_fd);
+        daemon.android_tun_mode = mode;
+        daemon
+    }
+
+    /// Attach the readiness flag used by the Android JNI lifecycle. This is
+    /// deliberately separate from `new_with_android_tun`: constructing the
+    /// daemon is not proof that its async control/TUN/dataplane setup worked.
+    #[cfg(target_os = "android")]
+    pub fn set_android_startup_ready(
+        &mut self,
+        ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.android_startup_ready = Some(ready);
+    }
+
+    /// Bind diagnostics to the JNI bridge/runtime incarnation that owns this
+    /// embedded daemon. It is set before `run()` starts the diagnostics task.
+    #[cfg(target_os = "android")]
+    pub fn set_android_runtime_incarnation(&mut self, incarnation: u64) {
+        self.android_runtime_incarnation = (incarnation > 0).then_some(incarnation);
+    }
+
+    /// Install the Android callback hint stream. The daemon retains the
+    /// sender so every transport supervisor can subscribe independently while
+    /// the JNI runtime handle remains the owner of the channel lifetime.
+    #[cfg(target_os = "android")]
+    pub fn set_android_network_change_sender(
+        &mut self,
+        sender: broadcast::Sender<AndroidNetworkChangeHint>,
+    ) {
+        self.android_network_change_direct_rx = Some(Arc::new(Mutex::new(sender.subscribe())));
+        self.android_network_change_relay_rx = Some(Arc::new(Mutex::new(sender.subscribe())));
+        self.android_network_change_control_rx = Some(Arc::new(Mutex::new(sender.subscribe())));
+    }
+
+    /// Forward Android's already-authorized physical-network edge into the
+    /// existing control lifecycle. This bridge does not own connection state
+    /// or create a second lifecycle loop.
+    #[cfg(target_os = "android")]
+    async fn spawn_android_network_change_control_watcher(&self) {
+        let Some(network_change_rx) = self.android_network_change_control_rx.clone() else {
+            return;
+        };
+        let control = self.control.clone();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        self.task_manager
+            .spawn("android-network-control", false, async move {
+                loop {
+                    let hint = tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                None
+                            } else {
+                                continue;
+                            }
+                        }
+                        hint = recv_android_network_change(network_change_rx.clone()) => hint,
+                    };
+                    if let Some(hint) = hint {
+                        control.network_changed(hint);
+                    } else {
+                        break;
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// Return a clone of the shutdown sender so main can signal SIGTERM/SIGINT.
+    pub fn shutdown_sender(&self) -> tokio::sync::watch::Sender<bool> {
+        self.shutdown_tx.clone()
+    }
+
+    /// Request a graceful shutdown.
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.task_manager.request_shutdown();
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn recv_android_network_change(
+    network_change_rx: AndroidNetworkChangeReceiver,
+) -> Option<AndroidNetworkChangeHint> {
+    crate::android_network_change::recv_latest(&network_change_rx).await
+}

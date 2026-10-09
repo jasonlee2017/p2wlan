@@ -1,0 +1,55 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+)
+
+var (
+	buildVersion = "dev"
+	buildCommit  = "unknown"
+)
+
+func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Printf("p2wlan-relay %s (%s)\n", buildVersion, buildCommit)
+		return
+	}
+	config, err := parseConfig(os.Args[1:])
+	if err != nil {
+		log.Fatalf("config error: %v", err)
+	}
+
+	server, err := NewRelayServer(config)
+	if err != nil {
+		log.Fatalf("listen error: %v", err)
+	}
+
+	if observerAddr := server.UDPObserverAddr(); observerAddr != nil {
+		log.Printf("p2wlan relay listening on %s; UDP observer on %s (limits: connections=%d, payload=%d)", server.Addr(), observerAddr, config.MaxConnections, config.MaxFramePayload)
+	} else {
+		log.Printf("p2wlan relay listening on %s (limits: connections=%d, payload=%d)", server.Addr(), config.MaxConnections, config.MaxFramePayload)
+	}
+	if config.MetricsBind != "" {
+		if _, err := server.ServeMetrics(); err != nil {
+			log.Fatalf("metrics listener error: %v", err)
+		}
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-stop
+		_ = server.Close()
+	}()
+
+	server.Serve()
+	// Serve can also return because the listener failed or was closed by a
+	// signal.  Wait for the same Close path here so connection/metrics cleanup
+	// completes before the process exits; sync.Once makes a concurrent signal
+	// handler call safe and waits for it when necessary.
+	_ = server.Close()
+}

@@ -1,0 +1,853 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  identity-gate:
+    name: Release identity gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Build release daemon for identity verification
+        run: cargo build -p p2wlan-daemon --release
+
+      - name: Verify clean version/commit/build identity
+        run: >
+          python3 scripts/release/verify_release_identity.py
+          --release
+          --daemon target/release/p2wlan-daemon
+          --expected-commit "$GITHUB_SHA"
+
+  quality-gate:
+    needs: identity-gate
+    name: Release required checks gate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Require release SHA on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "release SHA is not reachable from origin/main: $GITHUB_SHA" >&2
+            exit 1
+          }
+
+      - name: Require exact-SHA quality workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          runs="$RUNNER_TEMP/release-runs.json"
+          gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$RELEASE_SHA&status=completed&per_page=100" \
+            --slurp > "$runs"
+          required=(
+            "CI"
+            "Flutter Client"
+            "Package Test Builds"
+            "OpenWrt Packages"
+            "Windows Lifecycle"
+            "Mobile Lifecycle"
+            "Self-hosted Server"
+            "Security Audit"
+            "NAT Topology Gate"
+            "Path State Machine"
+            "Path Observability"
+            "DPLPMTUD Required"
+            "Business MTU Budget Required"
+            "Friend Rooms"
+            "Parallel Rooms"
+            "Room Connectivity"
+            "Rekey Reliability"
+          )
+          for workflow in "${required[@]}"; do
+            if ! jq -e --arg workflow "$workflow" --arg sha "$RELEASE_SHA" '
+              [.[].workflow_runs[]? | select(.name == $workflow and .head_sha == $sha and .conclusion == "success")] | length > 0
+            ' "$runs" >/dev/null; then
+              echo "missing successful required workflow for release SHA: $workflow ($RELEASE_SHA)" >&2
+              exit 1
+            fi
+          done
+
+  flutter-android:
+    needs: quality-gate
+    name: Flutter Android arm64 APK
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: release-signing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Set up Rust Android targets
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: aarch64-linux-android
+
+      - name: Configure Flutter-pinned Android NDK for Rust bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+          ndk_version="$(grep -RhoE 'ndkVersion[[:space:]]*=[[:space:]]*"[0-9.]+"' "$FLUTTER_ROOT/packages/flutter_tools/gradle" | head -n 1 | sed -E 's/.*"([0-9.]+)"/\1/')"
+          test -n "$ndk_version" || { echo "unable to resolve Flutter-pinned Android NDK version" >&2; exit 1; }
+          ndk_root="$sdk_root/ndk/$ndk_version"
+          if [[ ! -d "$ndk_root" ]]; then
+            sdkmanager_bin="$(command -v sdkmanager || true)"
+            if [[ -z "$sdkmanager_bin" ]]; then
+              sdkmanager_bin="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager -perm -u+x 2>/dev/null | head -n 1)"
+            fi
+            test -n "$sdkmanager_bin" || { echo "sdkmanager is unavailable while installing Flutter-pinned Android NDK $ndk_version" >&2; exit 1; }
+            # sdkmanager exits after accepting the license, so `yes` can receive
+            # SIGPIPE even when the installation itself succeeds. Preserve the
+            # sdkmanager status without letting that expected pipe close fail
+            # the release job.
+            set +e
+            set +o pipefail
+            yes 2>/dev/null | "$sdkmanager_bin" --sdk_root="$sdk_root" "ndk;$ndk_version"
+            sdkmanager_status="${PIPESTATUS[1]}"
+            set -o pipefail
+            set -e
+            test "$sdkmanager_status" -eq 0
+          fi
+          test -d "$ndk_root" || { echo "Flutter-pinned Android NDK is unavailable after installation: $ndk_root" >&2; exit 1; }
+          echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
+          echo "Using Android NDK $ndk_version"
+
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Restore SDK-migrated files (pre-build)
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Configure stable Android release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_KEYSTORE_BASE64:?Missing repository secret ANDROID_KEYSTORE_BASE64}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Missing repository secret ANDROID_KEYSTORE_PASSWORD}"
+          : "${ANDROID_KEY_ALIAS:?Missing repository secret ANDROID_KEY_ALIAS}"
+          : "${ANDROID_KEY_PASSWORD:?Missing repository secret ANDROID_KEY_PASSWORD}"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode \
+            > apps/flutter_client/android/app/release-keystore.jks
+          chmod 600 apps/flutter_client/android/app/release-keystore.jks
+          cat > apps/flutter_client/android/key.properties <<EOF
+          storeFile=app/release-keystore.jks
+          storePassword=${ANDROID_KEYSTORE_PASSWORD}
+          keyAlias=${ANDROID_KEY_ALIAS}
+          keyPassword=${ANDROID_KEY_PASSWORD}
+          EOF
+          chmod 600 apps/flutter_client/android/key.properties
+
+      - name: Build Android arm64 release APK
+        working-directory: apps/flutter_client
+        env:
+          P2WLAN_ANDROID_ABIS: arm64-v8a
+        run: >
+          bash ../../scripts/release/build_flutter_client.sh apk
+          --release
+          --target-platform android-arm64
+          --split-per-abi
+          --split-debug-info build/symbols/android-arm64
+
+      - name: Verify APK contains only arm64-v8a
+        working-directory: apps/flutter_client
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+          test -f "$apk"
+          actual_abis="$(unzip -Z1 "$apk" \
+            | sed -n 's#^lib/\([^/]*\)/.*#\1#p' \
+            | sort -u \
+            | paste -sd, -)"
+          if [[ "$actual_abis" != "arm64-v8a" ]]; then
+            echo "Expected only arm64-v8a in $apk, found: ${actual_abis:-none}" >&2
+            exit 1
+          fi
+          echo "android_apk_sha256=$(sha256sum "$apk" | awk '{print $1}')"
+
+      - name: Assemble Android release artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          cp apps/flutter_client/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+            dist-release/p2wlan-android-arm64-release.apk
+
+      - name: Bind Android artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-android-arm64-release.apk
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform android
+          --arch arm64
+          --identity client-stamped
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-android-arm64-release
+          path: |
+            dist-release/p2wlan-android-arm64-release.apk
+            dist-release/p2wlan-android-arm64-release.apk.metadata.json
+
+  flutter-ios:
+    needs: quality-gate
+    name: Flutter iOS arm64 IPA
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Restore SDK-migrated files (pre-build)
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Build unsigned iOS release app
+        working-directory: apps/flutter_client
+        run: >
+          bash ../../scripts/release/build_flutter_client.sh ios
+          --release
+          --no-codesign
+          --split-debug-info build/symbols/ios-arm64
+
+      - name: Assemble unsigned iOS IPA
+        run: |
+          set -euo pipefail
+          app="apps/flutter_client/build/ios/iphoneos/Runner.app"
+          payload="$RUNNER_TEMP/p2wlan-ios-payload"
+          rm -rf "$payload"
+          mkdir -p "$payload/Payload" dist-release
+          ditto "$app" "$payload/Payload/P2WLAN.app"
+          (cd "$payload" && zip -qry "$GITHUB_WORKSPACE/dist-release/p2wlan-ios-arm64-unsigned.ipa" Payload)
+
+      - name: Bind iOS artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-ios-arm64-unsigned.ipa
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform ios
+          --arch arm64
+          --identity client-stamped
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-ios-arm64-unsigned
+          path: |
+            dist-release/p2wlan-ios-arm64-unsigned.ipa
+            dist-release/p2wlan-ios-arm64-unsigned.ipa.metadata.json
+
+  flutter-macos:
+    needs: quality-gate
+    name: Flutter macOS ${{ matrix.arch }} DMG
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            lipo_arch: arm64
+            rust_target: aarch64-apple-darwin
+          - arch: x64
+            lipo_arch: x86_64
+            rust_target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Enable macOS desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-macos-desktop
+
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Restore SDK-migrated files (pre-build)
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Build macOS release app
+        working-directory: apps/flutter_client
+        run: >
+          bash ../../scripts/release/build_flutter_client.sh macos
+          --release
+          --split-debug-info build/symbols/macos
+
+      - name: Restore SDK-migrated files (pre-daemon-build)
+        run: bash scripts/release/hermetic_build.sh restore --macos
+
+      - name: Build macOS daemon for ${{ matrix.arch }}
+        run: cargo build -p p2wlan-daemon --release --target ${{ matrix.rust_target }}
+      - name: Restore SDK-migrated files
+        run: bash scripts/release/hermetic_build.sh restore --macos
+
+      - name: Diagnose checkout dirt
+        run: git status --porcelain=v1 --untracked-files=all
+
+      - name: Create architecture-specific DMG
+        run: |
+          set -euo pipefail
+          src="apps/flutter_client/build/macos/Build/Products/Release/P2WLAN.app"
+          work="$RUNNER_TEMP/p2wlan-macos-${{ matrix.arch }}"
+          app="$work/P2WLAN.app"
+          mkdir -p dist-release
+          rm -rf "$work"
+          mkdir -p "$work"
+          ditto "$src" "$app"
+          ln -s /Applications "$work/Applications"
+          install -m 0755 \
+            "target/${{ matrix.rust_target }}/release/p2wlan-daemon" \
+            "$app/Contents/Resources/p2wlan-daemon"
+          for binary in \
+            "$app/Contents/MacOS/P2WLAN" \
+            "$app/Contents/Frameworks/App.framework/Versions/A/App" \
+            "$app/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS"; do
+            lipo "$binary" -thin "${{ matrix.lipo_arch }}" -output "$binary.thin"
+            mv "$binary.thin" "$binary"
+          done
+          python3 scripts/release/verify_release_identity.py \
+            --release \
+            --daemon "$app/Contents/Resources/p2wlan-daemon" \
+            --app-info "$app/Contents/Info.plist" \
+            --expected-commit "$GITHUB_SHA"
+          codesign --force --deep --sign - "$app"
+          hdiutil create \
+            -volname "P2WLAN" \
+            -srcfolder "$work" \
+            -ov \
+            -format UDZO \
+            "dist-release/p2wlan-macos-${{ matrix.arch }}.dmg"
+
+      - name: Bind macOS artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-macos-${{ matrix.arch }}.dmg
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform macos
+          --arch ${{ matrix.arch }}
+          --identity client-stamped-daemon-verified
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-macos-${{ matrix.arch }}
+          path: |
+            dist-release/p2wlan-macos-${{ matrix.arch }}.dmg
+            dist-release/p2wlan-macos-${{ matrix.arch }}.dmg.metadata.json
+
+  flutter-linux:
+    needs: quality-gate
+    name: Flutter Linux ${{ matrix.arch }} Bundle
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+            target_platform: linux-x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            liblzma-dev
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Enable Linux desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-linux-desktop
+
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Restore SDK-migrated files (pre-build)
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Build Linux daemon
+        run: cargo build -p p2wlan-daemon --release
+
+      - name: Build Linux release bundle
+        working-directory: apps/flutter_client
+        run: >
+          bash ../../scripts/release/build_flutter_client.sh linux
+          --release
+          --target-platform ${{ matrix.target_platform }}
+          --split-debug-info build/symbols/linux-${{ matrix.arch }}
+
+      - name: Restore SDK-migrated files
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Diagnose checkout dirt
+        run: git status --porcelain=v1 --untracked-files=all
+
+      - name: Assemble Linux Flutter artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          bundle_dir="apps/flutter_client/build/linux/${{ matrix.arch }}/release/bundle"
+          if [ ! -d "$bundle_dir" ]; then
+            bundle_dir="$(find apps/flutter_client/build/linux -path '*/release/bundle' -type d | head -n 1)"
+          fi
+          if [ -z "$bundle_dir" ] || [ ! -d "$bundle_dir" ]; then
+            echo "Linux Flutter release bundle was not found." >&2
+            exit 1
+          fi
+          install -m 0755 target/release/p2wlan-daemon "$bundle_dir/p2wlan-daemon"
+          python3 scripts/release/verify_release_identity.py \
+            --release \
+            --daemon "$bundle_dir/p2wlan-daemon" \
+            --expected-commit "$GITHUB_SHA"
+          tar -C "$bundle_dir" -czf "dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz" .
+
+      - name: Bind Linux artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform linux
+          --arch ${{ matrix.arch }}
+          --identity client-stamped-daemon-verified
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-linux-${{ matrix.arch }}
+          path: |
+            dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz
+            dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz.metadata.json
+
+  flutter-windows:
+    needs: quality-gate
+    name: Flutter Windows ${{ matrix.arch }} Installer
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Enable Windows desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-windows-desktop
+
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Restore SDK-migrated files (pre-build)
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Build Windows daemon
+        run: cargo build -p p2wlan-daemon --release
+
+      - name: Build Windows release bundle
+        working-directory: apps/flutter_client
+        run: >
+          bash ../../scripts/release/build_flutter_client.sh windows
+          --release
+          --split-debug-info build/symbols/windows-${{ matrix.arch }}
+
+      - name: Run Windows startup integration tests
+        working-directory: apps/flutter_client
+        env:
+          P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
+        run: >
+          flutter test
+          test/windows_binary_probe_integration_test.dart
+          test/windows_tray_event_contract_test.dart
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Restore SDK-migrated files
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Diagnose checkout dirt
+        run: git status --porcelain=v1 --untracked-files=all
+
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          P2WLAN_ARCH: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "dist-release" | Out-Null
+          $releaseDir = Get-ChildItem -Path "apps\flutter_client\build\windows" -Directory -Recurse |
+            Where-Object { $_.FullName -match "\\runner\\Release$" } |
+            Select-Object -First 1
+          if (-not $releaseDir) {
+            throw "Windows Flutter release directory was not found."
+          }
+          $versionLine = Select-String -Path "apps\flutter_client\pubspec.yaml" -Pattern "^version:\s*(.+)$"
+          $version = $versionLine.Matches[0].Groups[1].Value.Split("+")[0]
+          $isccCandidates = @()
+          $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+          foreach ($base in @($programFilesX86, $env:ProgramFiles)) {
+            if ($base) {
+              $isccCandidates += (Join-Path $base "Inno Setup 6\ISCC.exe")
+            }
+          }
+          if ($env:ChocolateyInstall) {
+            $isccCandidates += (Join-Path $env:ChocolateyInstall "lib\innosetup\tools\ISCC.exe")
+          }
+          $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            throw "ISCC.exe was not found after installing Inno Setup."
+          }
+          $sourceDir = $releaseDir.FullName
+          Copy-Item "target\release\p2wlan-daemon.exe" (Join-Path $sourceDir "p2wlan-daemon.exe") -Force
+          & "apps\flutter_client\scripts\fetch_wintun.ps1" -DestinationDirectory $sourceDir -Architecture amd64
+          & "apps\flutter_client\scripts\bundle_msvc_runtime.ps1" -DestinationDirectory $sourceDir
+          foreach ($requiredFile in @("p2wlan_flutter_client.exe", "p2wlan-daemon.exe", "wintun.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")) {
+            if (-not (Test-Path (Join-Path $sourceDir $requiredFile))) {
+              throw "Windows release bundle is missing $requiredFile"
+            }
+          }
+          python3 scripts/release/verify_release_identity.py --release --daemon (Join-Path $sourceDir "p2wlan-daemon.exe") --expected-commit $env:GITHUB_SHA
+          $outputDir = (Resolve-Path "dist-release").Path
+          $iss = Join-Path $env:RUNNER_TEMP "p2wlan-windows.iss"
+          @"
+          #define SourceDir "$sourceDir"
+          #define OutputDir "$outputDir"
+          #define AppVersion "$version"
+          #define AppArch "$env:P2WLAN_ARCH"
+
+          [Setup]
+          AppId={{D2C22E34-410C-4273-B888-0E689638C994}
+          AppName=P2WLAN
+          AppVersion={#AppVersion}
+          AppPublisher=P2WLAN
+          DefaultDirName={localappdata}\Programs\P2WLAN
+          DefaultGroupName=P2WLAN
+          DisableProgramGroupPage=yes
+          OutputDir={#OutputDir}
+          OutputBaseFilename=p2wlan-windows-{#AppArch}-setup
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          PrivilegesRequired=lowest
+          UninstallDisplayIcon={app}\p2wlan_flutter_client.exe
+
+          [Files]
+          Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\P2WLAN"; Filename: "{app}\p2wlan_flutter_client.exe"
+          Name: "{autodesktop}\P2WLAN"; Filename: "{app}\p2wlan_flutter_client.exe"; Tasks: desktopicon
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+
+          [Run]
+          Filename: "{app}\p2wlan_flutter_client.exe"; Description: "Launch P2WLAN"; Flags: nowait postinstall skipifsilent
+          "@ | Set-Content -Path $iss -Encoding UTF8
+          & $iscc $iss
+
+      - name: Bind Windows artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform windows
+          --arch ${{ matrix.arch }}
+          --identity client-stamped-daemon-verified
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-windows-${{ matrix.arch }}-setup
+          path: |
+            dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe
+            dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe.metadata.json
+
+  linux-cli:
+    needs: quality-gate
+    name: Linux ${{ matrix.arch }} CLI Package
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-unknown-linux-gnu
+            cross_packages: ""
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            cross_packages: gcc-aarch64-linux-gnu
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross compiler
+        if: matrix.cross_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_packages }}
+
+      - name: Build Linux CLI and daemon
+        run: cargo build -p p2wlan-cli -p p2wlan-daemon --release --target ${{ matrix.target }}
+
+      - name: Assemble Linux CLI tarball
+        run: |
+          set -euo pipefail
+          name="p2wlan-linux-${{ matrix.arch }}-cli"
+          pkg="dist-release/$name"
+          mkdir -p "$pkg"
+          cp target/${{ matrix.target }}/release/p2wlan "$pkg/"
+          cp target/${{ matrix.target }}/release/p2wlan-daemon "$pkg/"
+          cp target/${{ matrix.target }}/release/p2wlan-daemon "$pkg/p2pnet-daemon"
+          cp scripts/install-linux-cli.sh "$pkg/install.sh"
+          cp LICENSE "$pkg/"
+          mkdir -p "$pkg/systemd"
+          cp deploy/systemd/p2wlan-daemon.service "$pkg/systemd/"
+          cp docs/guides/client.md "$pkg/"
+          cat > "$pkg/README-LINUX-CLI.txt" <<'EOF'
+          p2wlan Linux CLI
+
+          Contents:
+          - p2wlan: user-facing command-line client
+          - p2wlan-daemon: background daemon with real Linux TUN support
+          - p2pnet-daemon: legacy name of p2wlan-daemon
+          - install.sh: system-wide installer and fixed-version online installer
+          - client.md: Linux CLI, room, diagnostics, and systemd deployment guide
+          - systemd/p2wlan-daemon.service: hardened systemd unit template
+          - LICENSE
+
+          Install from this tarball:
+          1. sudo ./install.sh
+
+          Online install this fixed tag:
+          1. VERSION=${{ github.ref_name }}
+          2. curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/$VERSION/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+          3. sudo sh /tmp/p2wlan-install.sh --version "$VERSION"
+
+          Verify:
+          - p2wlan --version
+          - p2wlan help
+          EOF
+          chmod +x "$pkg/p2wlan" "$pkg/p2wlan-daemon" "$pkg/install.sh"
+          tar -C dist-release -czf "dist-release/$name.tar.gz" "$name"
+          (
+            cd dist-release
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          )
+
+      - name: Bind Linux CLI artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform linux-cli
+          --arch ${{ matrix.arch }}
+          --identity rust-source-bound
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-linux-${{ matrix.arch }}-cli
+          path: |
+            dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz
+            dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz.sha256
+            dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz.metadata.json
+
+  openwrt:
+    needs: quality-gate
+    uses: ./.github/workflows/openwrt.yml
+    with:
+      tag: ${{ github.ref_name }}
+
+  publish:
+    name: Publish complete client release
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.flutter-android.result == 'success' && needs.flutter-ios.result == 'success' && needs.flutter-macos.result == 'success' && needs.flutter-linux.result == 'success' && needs.flutter-windows.result == 'success' && needs.linux-cli.result == 'success' && needs.openwrt.result == 'success' }}
+    needs:
+      - flutter-android
+      - flutter-ios
+      - flutter-macos
+      - flutter-linux
+      - flutter-windows
+      - linux-cli
+      - openwrt
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Download all candidate artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: p2wlan-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify complete release set and write manifest
+        env:
+          P2WLAN_RELEASE_SHA: ${{ github.sha }}
+          P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/verify_release_set.py \
+            --directory release-assets \
+            --source-sha "$P2WLAN_RELEASE_SHA" \
+            --tag "$P2WLAN_RELEASE_TAG"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$P2WLAN_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "$P2WLAN_RELEASE_TAG" \
+            --generate-notes
+
+      - name: Upload complete release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mapfile -t public_assets < <(python3 - <<'PYASSETS'
+          import json
+          from pathlib import Path
+          root = Path('release-assets')
+          manifest = json.loads((root / 'RELEASE-MANIFEST.json').read_text())
+          for name in sorted([*manifest['files'], 'RELEASE-MANIFEST.json']):
+              print(root / name)
+          PYASSETS
+          )
+          for asset in "${public_assets[@]}"; do
+            test -f "$asset" || { echo "missing public release asset: $asset" >&2; exit 1; }
+          done
+          gh release upload "$P2WLAN_RELEASE_TAG" "${public_assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Publish release after asset upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$P2WLAN_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest=true

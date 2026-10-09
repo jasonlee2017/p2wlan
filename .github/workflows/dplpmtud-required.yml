@@ -1,0 +1,423 @@
+name: DPLPMTUD Required
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/dplpmtud-required.yml"
+      - ".github/workflows/business-mtu-budget-required.yml"
+      - "client/daemon/**"
+      - "client/netbind/**"
+      - "client/tun/**"
+      - "client/wireguard/**"
+      - "client/relay/**"
+      - "scripts/dplpmtud/**"
+      - "scripts/mtu-smoke.sh"
+      - "contracts/dplpmtud_acceptance.json"
+      - "docs/reference/networking.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/dplpmtud-required.yml"
+      - ".github/workflows/business-mtu-budget-required.yml"
+      - "client/daemon/**"
+      - "client/netbind/**"
+      - "client/tun/**"
+      - "client/wireguard/**"
+      - "client/relay/**"
+      - "scripts/dplpmtud/**"
+      - "scripts/mtu-smoke.sh"
+      - "contracts/dplpmtud_acceptance.json"
+      - "docs/reference/networking.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      validation_sha:
+        description: Exact commit SHA to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: read
+  actions: read
+
+concurrency:
+  # A commit validation (push / pull_request) and a periodic health check
+  # (schedule / workflow_dispatch) are different obligations for the same
+  # ref. Sharing one concurrency group let a scheduled run cancel an
+  # in-flight commit validation, so each event class gets its own group and
+  # only a pull request cancels its own superseded predecessors.
+  group: dplpmtud-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.validation_sha || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  P2WLAN_EXACT_HEAD: ${{ github.event.pull_request.head.sha || inputs.validation_sha || github.sha }}
+
+jobs:
+  contract:
+    name: DPLPMTUD contract and evidence tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact source checkout
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+      - name: Validate evidence scripts and contract
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/dplpmtud/collect_evidence.py \
+            scripts/dplpmtud/aggregate_evidence.py \
+            scripts/dplpmtud/test_evidence.py
+          python3 -m unittest discover \
+            -s scripts/dplpmtud \
+            -p 'test_*.py'
+          bash -n scripts/dplpmtud/run_acceptance.sh
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          value = json.loads(Path("contracts/dplpmtud_acceptance.json").read_text())
+          assert value["schema_version"] == 1
+          assert value["repository"] == "yhan-sun/p2wlan"
+          assert value["required_boundaries"] == [1280, 1360, 1380, 1420, 1500]
+          assert [item["scenario_id"] for item in value["scenarios"]] == [
+              f"DP-{index:02d}" for index in range(1, 11)
+          ]
+          assert len({item["test_id"] for item in value["scenarios"]}) == 10
+          PY
+
+  dplpmtud_linux:
+    name: DPLPMTUD Linux checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact source checkout
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+      - name: Cargo format
+        run: cargo fmt --all -- --check
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: DPLPMTUD reducer and wire tests
+        run: python3 scripts/quality/run_rust_tests.py dplpmtud
+      - name: Encrypted UDP blackhole test with evidence
+        run: python3 scripts/quality/run_rust_tests.py dplpmtud::runtime::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak --exact --nocapture
+      - name: Workspace tests except hard-hard E2E
+        env:
+          RUST_TEST_THREADS: "1"
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-features -- --test-threads=1 --skip hard_hard_ 2>&1 | tee /tmp/workspace-tests.log
+          ! grep -qE '0 tests, [1-9][0-9]* benchmarks' /tmp/workspace-tests.log
+      - name: Hard-hard E2E tests
+        run: python3 scripts/quality/run_rust_tests.py hard_hard_ --each
+
+  runtime_acceptance:
+    name: DPLPMTUD acceptance (${{ matrix.scenario }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: blackhole
+            test: dplpmtud::runtime::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak
+          - scenario: base-confirmation
+            test: dplpmtud::state_machine::tests::base_requires_a_positive_probe_before_any_confirmed_budget
+          - scenario: downward-1392-to-1280
+            test: dplpmtud::runtime::tests::runtime_downward_recovery_withholds_budget_until_fresh_base_ack
+          - scenario: below-base-1392-to-1100
+            test: dplpmtud::runtime::tests::same_identity_below_base_failure_enters_error_without_budget
+          - scenario: cancel-close-budget
+            test: dplpmtud::runtime::tests::cancel_close_generation_and_relay_budget_invalidation_acceptance
+          - scenario: budget-revision-aba
+            test: dplpmtud::runtime::tests::budget_revision_is_monotonic_and_closes_identity_aba
+          - scenario: local-emsgsize
+            test: dplpmtud::state_machine::tests::local_emsgsize_shrinks_upper_bound_without_reopening_full_ceiling
+          - scenario: worker-leak
+            test: dplpmtud::runtime::tests::close_and_peer_left_remove_all_worker_ownership
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact source checkout
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Run exact acceptance scenario
+        env:
+          DPLPMTUD_TEST: ${{ matrix.test }}
+        run: python3 scripts/quality/run_rust_tests.py "$DPLPMTUD_TEST" --exact --nocapture
+
+  live_evidence:
+    name: DPLPMTUD live dataplane evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify source and workflow identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+          workflow_sha="$(git rev-parse "$P2WLAN_EXACT_HEAD:.github/workflows/dplpmtud-required.yml")"
+          test "$workflow_sha" != "$P2WLAN_EXACT_HEAD"
+          echo "DPLPMTUD_SOURCE_HEAD_SHA=$P2WLAN_EXACT_HEAD" >> "$GITHUB_ENV"
+          echo "DPLPMTUD_WORKFLOW_SHA=$workflow_sha" >> "$GITHUB_ENV"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+      - name: Run actual-test-derived live acceptance
+        run: bash scripts/dplpmtud/run_acceptance.sh "$RUNNER_TEMP/p2wlan-dplpmtud-live"
+      - name: Upload live component evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dplpmtud-live-component-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p2wlan-dplpmtud-live/**
+          if-no-files-found: error
+          retention-days: 90
+
+  dplpmtud_windows:
+    name: DPLPMTUD Windows tests
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact source checkout
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne $env:P2WLAN_EXACT_HEAD) {
+            throw "exact source checkout mismatch"
+          }
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Run reducer and wire tests
+        run: python3 scripts/quality/run_rust_tests.py dplpmtud
+      - name: Run final path/boundary tests
+        run: cargo test -p p2wlan-daemon --lib dplpmtud_final_ -- --nocapture --test-threads=1
+      - name: Build Windows daemon
+        run: cargo build -p p2wlan-daemon
+
+  existing_required_gates:
+    name: DPLPMTUD external required gates
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require same-SHA business, path, topology, lifecycle, package, security and observability gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Untrusted event data must reach the shell through a validated env
+          # value, never by direct interpolation.
+          P2WLAN_GATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 scripts/quality/check_required_gates.py \
+            --sha "$P2WLAN_GATE_HEAD_SHA" \
+            --require "Business MTU Budget Required" \
+            --require "Path State Machine Required" \
+            --require "NAT Topology Required" \
+            --require "Windows Lifecycle Required" \
+            --require "Mobile Lifecycle Required" \
+            --require "Path Observability Required" \
+            --require "Security Audit Required" \
+            --require "CI Required" \
+            --require "OpenWrt Packages Required" \
+            --require "Analyze and Test" \
+            --require "Android arm64 CI test APK" \
+            --require "iOS Compile" \
+            --require "Linux x64 Release Bundle" \
+            --require "macOS Release Apps" \
+            --require "Windows x64 Release Bundle" \
+            --require "macOS arm64 test DMG" \
+            --require "Android arm64 test APK" \
+            --timeout-seconds 3900
+  evidence_aggregate:
+    name: DPLPMTUD evidence aggregate
+    if: always()
+    needs:
+      - contract
+      - live_evidence
+      - existing_required_gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact aggregate identity
+        id: identity
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$P2WLAN_EXACT_HEAD"
+          workflow_sha="$(git rev-parse "$actual:.github/workflows/dplpmtud-required.yml")"
+          {
+            echo "source_head_sha=$actual"
+            echo "workflow_sha=$workflow_sha"
+          } >> "$GITHUB_OUTPUT"
+      - name: Download every live component attempt of this run
+        id: download
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          # A partial re-run uploads nothing new: the component artifact stays
+          # under the attempt that produced it. Fetch every attempt of this run
+          # and let the selector decide which one may be consumed.
+          pattern: dplpmtud-live-component-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/dplpmtud-component
+          merge-multiple: false
+      - name: Select the component evidence this aggregate may consume
+        id: select
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPONENT_RESULT: ${{ needs.live_evidence.result }}
+          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+          WORKFLOW_SHA: ${{ steps.identity.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/dplpmtud/select_component_artifact.py \
+            --artifacts-root "$RUNNER_TEMP/dplpmtud-component" \
+            --contract contracts/dplpmtud_acceptance.json \
+            --source-head-sha "$SOURCE_HEAD_SHA" \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --current-attempt "$GITHUB_RUN_ATTEMPT" \
+            --component-result "$COMPONENT_RESULT" \
+            --output "$GITHUB_OUTPUT"
+      - name: Aggregate fail-closed evidence
+        id: aggregate
+        if: always()
+        env:
+          COMPONENT_RESULT: ${{ needs.live_evidence.result }}
+          EXTERNAL_RESULT: ${{ needs.existing_required_gates.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+          WORKFLOW_SHA: ${{ steps.identity.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/dplpmtud/aggregate_evidence.py \
+            --contract contracts/dplpmtud_acceptance.json \
+            --component "${{ steps.select.outputs.component }}" \
+            --source-head-sha "$SOURCE_HEAD_SHA" \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --event-name "$EVENT_NAME" \
+            --component-result "$COMPONENT_RESULT" \
+            --external-gates-result "$EXTERNAL_RESULT" \
+            --component-run-id "${{ steps.select.outputs.component_run_id }}" \
+            --component-run-attempt "${{ steps.select.outputs.component_run_attempt }}" \
+            --component-reused "${{ steps.select.outputs.component_reused }}" \
+            --current-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/dplpmtud-aggregate.json"
+      - name: Upload DPLPMTUD aggregate
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dplpmtud-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dplpmtud-aggregate.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Enforce aggregate construction
+        if: always()
+        env:
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          LIVE_RESULT: ${{ needs.live_evidence.result }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          SELECT_OUTCOME: ${{ steps.select.outcome }}
+          AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
+        run: |
+          set -euo pipefail
+          test "$CONTRACT_RESULT" = "success"
+          test "$LIVE_RESULT" = "success"
+          test "$DOWNLOAD_OUTCOME" = "success"
+          test "$SELECT_OUTCOME" = "success"
+          test "$AGGREGATE_OUTCOME" = "success"
+
+  required:
+    name: DPLPMTUD Required
+    if: always()
+    needs:
+      - contract
+      - dplpmtud_linux
+      - runtime_acceptance
+      - live_evidence
+      - dplpmtud_windows
+      - existing_required_gates
+      - evidence_aggregate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce aggregate results
+        env:
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          LINUX_RESULT: ${{ needs.dplpmtud_linux.result }}
+          ACCEPTANCE_RESULT: ${{ needs.runtime_acceptance.result }}
+          LIVE_RESULT: ${{ needs.live_evidence.result }}
+          WINDOWS_RESULT: ${{ needs.dplpmtud_windows.result }}
+          EXTERNAL_RESULT: ${{ needs.existing_required_gates.result }}
+          EVIDENCE_RESULT: ${{ needs.evidence_aggregate.result }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          test "$CONTRACT_RESULT" = "success"
+          test "$LINUX_RESULT" = "success"
+          test "$ACCEPTANCE_RESULT" = "success"
+          test "$LIVE_RESULT" = "success"
+          test "$WINDOWS_RESULT" = "success"
+          test "$EVIDENCE_RESULT" = "success"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            test "$EXTERNAL_RESULT" = "success"
+          else
+            test "$EXTERNAL_RESULT" = "skipped"
+          fi

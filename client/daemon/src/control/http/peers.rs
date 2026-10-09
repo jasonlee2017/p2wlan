@@ -1,0 +1,262 @@
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn poll_peers(
+    http: &reqwest::Client,
+    http_pool_id: u64,
+    base_url: &str,
+    token: &str,
+    config: &Config,
+    self_node_id: &str,
+    registration_seq: Option<u64>,
+    state: &Arc<RwLock<ClientState>>,
+    event_tx: &mpsc::UnboundedSender<ControlEvent>,
+) -> Result<()> {
+    let server_clock = state.read().await.server_clock.clone();
+    let timing_identity = server_clock.request_identity(registration_seq, http_pool_id);
+    let request_started = std::time::Instant::now();
+    let sent_wall_ms = unix_time_millis();
+    let res = with_registration_sequence(
+        http.get(format!(
+            "{base_url}/api/v1/nodes?network_id={}",
+            config.network.network_id
+        ))
+        .timeout(CONTROL_REQUEST_TIMEOUT)
+        .bearer_auth(token),
+        registration_seq,
+    )
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("list nodes request failed: {e}")))?;
+
+    let received_at = std::time::Instant::now();
+    let received_wall_ms = unix_time_millis();
+    let request_elapsed = received_at.saturating_duration_since(request_started);
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let (detail, error_code, current_seq) = control_error_detail(res).await;
+        if matches!(status.as_u16(), 401 | 403 | 404) {
+            state.read().await.room_authorization.invalidate();
+        }
+        if let Some(error) = registration_conflict_error(status, error_code, current_seq, &detail) {
+            return Err(error);
+        }
+        return Err(DaemonError::ControlPlane(format!(
+            "list nodes request returned HTTP {status}: {detail}",
+        )));
+    }
+
+    let body: ListNodesResponse = res
+        .json()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("list nodes decode failed: {e}")))?;
+
+    if let (Some(identity), Some(server_time_ms)) = (timing_identity, body.server_time_ms) {
+        server_clock.observe_short_request(
+            identity,
+            server_time_ms,
+            sent_wall_ms,
+            received_wall_ms,
+            request_elapsed,
+            received_at,
+        );
+    } else {
+        server_clock.clear_timing();
+    }
+    let room_authorization = state.read().await.room_authorization.clone();
+    if room_authorization.enabled() {
+        let local = body
+            .nodes
+            .iter()
+            .find(|node| node.id == self_node_id && node.public_key == config.node.public_key);
+        let valid = local.is_some_and(|local| {
+            room_authorization.replace(
+                &local.virtual_ip,
+                body.nodes
+                    .iter()
+                    .filter(|node| node.id != self_node_id)
+                    .map(|node| (node.id.clone(), node.virtual_ip.clone())),
+                request_started,
+                body.authorization_lease_seconds,
+            )
+        });
+        if !valid {
+            room_authorization.invalidate();
+            return Err(DaemonError::ControlPlane(
+                "room authorization roster is missing, invalid or expired".into(),
+            ));
+        }
+    }
+
+    debug!(
+        "poll_peers: received {} nodes from control plane (self_node_id={})",
+        body.nodes.len(),
+        self_node_id
+    );
+
+    let mut seen = HashMap::new();
+    let mut joined = Vec::new();
+    let mut updated = Vec::new();
+
+    {
+        let mut state = state.write().await;
+
+        for node in body.nodes {
+            if node.id == self_node_id || node.public_key == config.node.public_key {
+                continue;
+            }
+
+            let peer = PeerInfo {
+                node_id: node.id.clone(),
+                device_name: node.device_name,
+                app_version: node.app_version,
+                capabilities: node.capabilities,
+                registration_seq: node.registration_seq,
+                public_key: node.public_key,
+                endpoint: node.endpoint,
+                nat_type: node.nat_type,
+                virtual_ip: node.virtual_ip,
+                online: node.online,
+                last_seen: node.last_seen,
+                relay_rtt_ms: node.relay_rtt_ms,
+            };
+
+            if let Some(known) = state.peers.get(&peer.node_id) {
+                if known.public_key == peer.public_key
+                    && known.registration_seq > peer.registration_seq
+                {
+                    seen.insert(known.node_id.clone(), known.clone());
+                    continue;
+                }
+            }
+            seen.insert(peer.node_id.clone(), peer.clone());
+            match state.peers.get(&peer.node_id) {
+                Some(known) if peer_metadata_changed(known, &peer) => updated.push(peer.clone()),
+                None => joined.push(peer.clone()),
+                _ => {}
+            }
+            state.peers.insert(peer.node_id.clone(), peer);
+        }
+
+        let departed: Vec<String> = state
+            .peers
+            .keys()
+            .filter(|node_id| !seen.contains_key(*node_id))
+            .cloned()
+            .collect();
+
+        for node_id in departed {
+            state.peers.remove(&node_id);
+            let _ = event_tx.send(ControlEvent::PeerLeft(node_id));
+        }
+    }
+
+    debug!(
+        "poll_peers: {} joined, {} updated, {} total known peers",
+        joined.len(),
+        updated.len(),
+        seen.len()
+    );
+
+    // The control plane also returns historical/offline device rows.  A
+    // cold-start roster can therefore contain dozens of records before the
+    // one live peer that can carry the first business packet.  Control-event
+    // handling performs bounded per-peer work, so preserve the dataplane
+    // invariant that a live peer is admitted before an offline historical
+    // record.  Within the same liveness class, prefer the most recently seen
+    // device and use node_id only as a deterministic tie-breaker.
+    let prioritize_live = |left: &PeerInfo, right: &PeerInfo| {
+        right
+            .online
+            .cmp(&left.online)
+            .then_with(|| right.last_seen.cmp(&left.last_seen))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    };
+    joined.sort_by(prioritize_live);
+    updated.sort_by(prioritize_live);
+
+    for peer in joined {
+        let _ = event_tx.send(ControlEvent::PeerJoined(peer));
+    }
+    for peer in updated {
+        let _ = event_tx.send(ControlEvent::PeerUpdated(peer));
+    }
+
+    Ok(())
+}
+
+pub(super) fn peer_metadata_changed(known: &PeerInfo, peer: &PeerInfo) -> bool {
+    known.device_name != peer.device_name
+        || known.app_version != peer.app_version
+        || known.capabilities != peer.capabilities
+        || known.registration_seq != peer.registration_seq
+        || known.public_key != peer.public_key
+        || known.endpoint != peer.endpoint
+        || known.nat_type != peer.nat_type
+        || known.virtual_ip != peer.virtual_ip
+        || known.online != peer.online
+        // `last_seen` is user-visible diagnostics and part of peer liveness.
+        // Suppressing heartbeat-only updates left PeerManager permanently on
+        // the join-time value even while ClientState kept advancing it.
+        || known.last_seen != peer.last_seen
+        || known.relay_rtt_ms != peer.relay_rtt_ms
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn create_tunnel(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    device_id: &str,
+    registration_seq: Option<u64>,
+    protocol: &str,
+    local_port: u16,
+    remote_port: u16,
+) -> Result<(String, String)> {
+    let res = with_registration_sequence(
+        http.post(format!("{base_url}/api/v1/tunnels"))
+            .timeout(CONTROL_REQUEST_TIMEOUT)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "device_id": device_id,
+                "protocol": protocol,
+                "local_port": local_port,
+                "remote_port": remote_port,
+                "local_address": "127.0.0.1",
+            })),
+        registration_seq,
+    )
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("create tunnel request failed: {e}")))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let (detail, error_code, current_seq) = control_error_detail(res).await;
+        if let Some(error) = registration_conflict_error(status, error_code, current_seq, &detail) {
+            return Err(error);
+        }
+        return Err(DaemonError::ControlPlane(format!(
+            "create tunnel request returned HTTP {status}: {detail}",
+        )));
+    }
+
+    let body: CreateTunnelResponse = res
+        .json()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("create tunnel decode failed: {e}")))?;
+
+    if !body.success {
+        return Err(DaemonError::ControlPlane(
+            body.error
+                .unwrap_or_else(|| "create tunnel failed".to_string()),
+        ));
+    }
+
+    Ok((
+        body.tunnel_id
+            .ok_or_else(|| DaemonError::ControlPlane("create tunnel response missing id".into()))?,
+        body.public_endpoint.ok_or_else(|| {
+            DaemonError::ControlPlane("create tunnel response missing public endpoint".into())
+        })?,
+    ))
+}

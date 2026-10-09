@@ -1,0 +1,1030 @@
+// ============================================================
+// Peer Connection
+// ============================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeSessionBinding {
+    token: Option<String>,
+    session_id: Option<String>,
+    ephemeral_shared: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedProbeSessionBinding {
+    binding: ProbeSessionBinding,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingProbeSessionBinding {
+    binding: ProbeSessionBinding,
+    expires_at: Instant,
+    promote_on_match: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteNatProfileBindFailure {
+    PeerMissing,
+    ProfileMissing,
+    ProfileExpired,
+    ProfileGenerationMissing,
+    ProfileGenerationMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteNatProfileBindSnapshot {
+    pub(crate) candidate_epoch: Option<u64>,
+    pub(crate) profile_candidate_epoch: Option<u64>,
+    pub(crate) profile_present: bool,
+    pub(crate) profile_generation: Option<u64>,
+    pub(crate) profile_fresh: bool,
+    pub(crate) declared_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteNatProfileBindResult {
+    Bound(RemoteNatProfileBindSnapshot),
+    Rejected {
+        reason: RemoteNatProfileBindFailure,
+        snapshot: RemoteNatProfileBindSnapshot,
+    },
+}
+
+impl RemoteNatProfileBindSnapshot {
+    pub(crate) fn missing_peer(declared_generation: u64) -> Self {
+        Self {
+            candidate_epoch: None,
+            profile_candidate_epoch: None,
+            profile_present: false,
+            profile_generation: None,
+            profile_fresh: false,
+            declared_generation,
+        }
+    }
+}
+
+/// The relay-first business gate state for one peer connection.
+///
+/// This is the set of fields that describe relay-first startup/fallback
+/// evidence after a same-generation relay transport is ready and
+/// peer-confirmed. Grouping them here (instead of flat on [`PeerConnection`])
+/// keeps the legal/illegal state combinations locally contained: the gate is
+/// one atomic concept with a bounded set of milestones, not N independent
+/// booleans scattered across a 60-field struct. An authoritative current
+/// Direct pair is primary and does not wait for these business markers.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RelayFirstBusinessState {
+    /// Generation in which the first-business relay gate began waiting.  This
+    /// is distinct from `relay_ready_at`: the gate may start as soon as the
+    /// shared relay transport exists, before the per-peer session publishes
+    /// its ready milestone.
+    pub gate_generation: Option<u64>,
+    /// Monotonic start of the bounded first-business relay gate.
+    pub gate_started_at: Option<Instant>,
+    /// Generation for which at least one real business packet was accepted by
+    /// the confirmed relay writer. This is relay fallback evidence; an
+    /// authoritative current Direct pair does not wait for both directions.
+    /// The receive marker is kept separately because a peer can send its first
+    /// packet over relay and later deliver the other direction directly.
+    pub business_sent_generation: Option<u64>,
+    /// Generation for which a normal decrypted business packet was received
+    /// through the confirmed relay.  This closes the bidirectional relay-first
+    /// race: local relay writer completion alone cannot authorize Direct for
+    /// the other direction.
+    pub business_received_generation: Option<u64>,
+    /// Generation for which a relay business packet was sent locally and a
+    /// normal relay business packet was received. Writer completion is not a
+    /// peer-delivery proof; this two-direction marker records that both
+    /// directions crossed the confirmed relay. The two component markers may
+    /// arrive in either order.
+    pub business_exchange_generation: Option<u64>,
+    /// Generation for which a synthetic path-commit probe round-tripped over
+    /// the confirmed relay, proving bidirectional relay data without natural
+    /// traffic (audit P0-4). An alternative to `..._exchange_generation` for
+    /// completing relay fallback evidence; it does not itself activate
+    /// Direct.
+    pub business_pathcommit_generation: Option<u64>,
+    /// Generation in which the relay-first business gate completed at least
+    /// once.  Unlike the per-transport business markers above, this survives
+    /// a make-before-break relay ticket renewal: the replacement transport
+    /// still needs a fresh encrypted relay confirmation for fallback, but an
+    /// already-established Direct path must not be demoted and forced to
+    /// repeat the initial relay-first gate.
+    pub business_gate_completed_generation: Option<u64>,
+}
+
+/// No-await, generation-bound projection of one peer's committed business
+/// path. It contains typed state-machine values rather than compatibility
+/// booleans or an independently selected path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedBusinessPathSnapshot {
+    pub(crate) peer_id: String,
+    pub(crate) virtual_ip: String,
+    pub(crate) lifecycle: PeerPathLifecycle,
+    pub(crate) epoch: Option<PathEpoch>,
+    pub(crate) active: ActiveBusinessPath,
+}
+
+impl CommittedBusinessPathSnapshot {
+    pub(crate) fn active_path(&self) -> Option<NetworkPath> {
+        self.active.network_path()
+    }
+
+    pub(crate) fn is_online_in_generation(&self, generation: u64) -> bool {
+        self.lifecycle == PeerPathLifecycle::Online
+            && self
+                .epoch
+                .is_some_and(|epoch| epoch.network_generation == generation)
+    }
+}
+
+/// Information about a connection to a specific peer.
+#[derive(Debug, Clone)]
+pub struct PeerConnection {
+    /// Peer node ID.
+    pub node_id: String,
+    /// Human-readable peer device name.
+    pub device_name: String,
+    /// Peer application/daemon version reported by the control plane.
+    pub app_version: String,
+    /// Authenticated registration-scoped wire capabilities; absent means legacy.
+    pub capabilities: crate::control::PeerCapabilities,
+    pub registration_seq: u64,
+    /// Peer's static WireGuard/X25519 public key as hex.
+    pub public_key: String,
+    /// Symmetric MAC key for authenticated UDP Probe v2.
+    pub probe_mac_key: Option<ProbeMacKey>,
+    /// Current control-plane session ID used to bind Probe v2 MAC keys.
+    pub probe_session_id: Option<String>,
+    /// Session-local X25519 shared secret used to rotate Probe v2 MAC keys.
+    pub probe_ephemeral_shared: Option<[u8; 32]>,
+    /// Opaque handshake token associated with the current Probe-v2 binding.
+    probe_binding_token: Option<String>,
+    /// Replacement Probe-v2 binding staged transactionally during a handshake.
+    pending_probe_bindings: HashMap<String, PendingProbeSessionBinding>,
+    /// Prior Probe-v2 binding accepted during a rekey overlap or restored when
+    /// publishing the replacement offer fails.
+    previous_probe_binding: Option<RetainedProbeSessionBinding>,
+    /// Peer's virtual IP.
+    pub virtual_ip: String,
+    /// Peer's public endpoint (ip:port) if known.
+    pub endpoint: Option<SocketAddr>,
+    /// Endpoint currently advertised by peer metadata. This is kept separate
+    /// from an authenticated peer-reflexive endpoint learned on the wire.
+    pub signaled_endpoint: Option<SocketAddr>,
+    /// Peer's NAT type.
+    pub nat_type: String,
+    /// Structured remote NAT evidence carried by the compatibility control
+    /// label. This is advisory until its generation and receive age pass the
+    /// freshness fence; authenticated candidate/path evidence remains the
+    /// authority for promotion.
+    pub remote_nat_profile: Option<RemoteNatProfile>,
+    /// Remote profile context captured when the profile was accepted. Age
+    /// and profile generation alone cannot authorize Hard↔Hard after a newer
+    /// candidate set has been published.
+    remote_nat_profile_candidate_epoch: Option<u64>,
+    /// Whether the control plane currently reports this peer online.
+    pub online: bool,
+    /// Last seen timestamp reported by the control plane.
+    pub last_seen: u64,
+    /// Peer-reported RTT to its selected relay server, in milliseconds.
+    pub remote_relay_rtt_ms: Option<u64>,
+    /// Current connection state.
+    pub state: ConnectionState,
+    /// Authoritative typed path state. `state` above is updated atomically as
+    /// its compatibility projection by `commit_path_transition`.
+    path_state_machine: PathStateMachine,
+    /// Bounded, synchronous telemetry recorded only at the typed commit point.
+    path_observability: PathObservabilityState,
+    /// When the connection was established.
+    pub connected_at: Option<Instant>,
+    /// Bytes sent to this peer.
+    pub bytes_sent: u64,
+    /// Bytes received from this peer.
+    pub bytes_received: u64,
+    /// Which relay server is being used (if connected via relay).
+    pub relay_server: Option<String>,
+    /// ICE candidates for this peer.
+    pub candidates: Vec<String>,
+    /// Candidate strings from the most recent peer offer/answer.
+    signaled_candidates: HashSet<String>,
+    /// Newer candidate sets replace older ones; generation 0 remains valid for
+    /// legacy peers that have not yet been upgraded.
+    last_candidate_generation: u64,
+    /// Highest encoded remote daemon incarnation observed for this identity.
+    ///
+    /// This must not be derived from `last_candidate_generation`: a remote
+    /// restart clears candidate/path state before the replacement signal is
+    /// applied, and a second restart can arrive through the deferred responder
+    /// lane during that gap. Keeping the incarnation high-water independent
+    /// prevents an older deferred signal from rotating the lifecycle backwards.
+    remote_candidate_incarnation_high_water: Option<u64>,
+    /// Local monotonic epoch for the accepted remote candidate set. This is
+    /// intentionally separate from the wire generation because legacy peers
+    /// may repeatedly publish generation `0`.
+    remote_candidate_epoch: u64,
+    /// Directly-connected local interface prefixes used to identify a remote
+    /// Host candidate as genuinely on-link. This prevents RFC1918/ULA or
+    /// overlay addresses from being treated as LAN merely by address class.
+    local_interface_networks: Vec<LocalNetwork>,
+    last_candidates_expires_at_ms: Option<u64>,
+    /// Local-only source metadata keyed by candidate endpoint string.
+    pub candidate_sources: HashMap<String, CandidatePairSource>,
+    /// Direct UDP path health.
+    pub direct_health: PathHealth,
+    /// Relay path health.
+    pub relay_health: PathHealth,
+    /// Local network generation in which the direct path was last confirmed.
+    pub direct_generation: u64,
+    /// Monotonic direct-commit sequence.  Bumped inside the network-epoch
+    /// critical section every time the Direct confirmation changes (promotion
+    /// or endpoint change); outbound punch loops gate every actual UDP send
+    /// on this sequence.
+    pub direct_commit_seq: u64,
+    /// Local network generation in which a relay transport first became ready
+    /// to carry this peer's traffic (the shared relay slot published an
+    /// endpoint while the peer had an encrypting WireGuard session).  This is
+    /// the per-peer `RelayTransportConnected` milestone: it is strictly weaker
+    /// than `relay_confirmed_generation` (a TCP/TLS connect or a queued
+    /// registration must never count as delivery).
+    pub relay_ready_generation: Option<u64>,
+    /// Monotonic instant (daemon-local) of the per-peer relay-ready milestone.
+    pub relay_ready_at: Option<Instant>,
+    /// Relay endpoint that carried the per-peer relay-ready milestone.
+    pub relay_ready_endpoint: Option<String>,
+    /// Local relay transport incarnation that carried the per-peer
+    /// relay-ready milestone.  The endpoint may be reused by a reconnect, so
+    /// endpoint + generation alone is not enough to bind readiness to the
+    /// current writer/reader pair.
+    pub relay_ready_connection_id: Option<u64>,
+    /// Local network generation in which the relay path to this peer was
+    /// confirmed by a matching forced-relay encrypted probe/ACK (the ACK's real
+    /// ingress was relay).  Never set by a local TCP/TLS connect or by a
+    /// command-queue accept.
+    pub relay_confirmed_generation: Option<u64>,
+    /// Monotonic instant (daemon-local) of the relay peer confirmation.
+    pub relay_confirmed_at: Option<Instant>,
+    /// Relay endpoint whose ingress carried the confirming ACK.
+    pub relay_confirmed_endpoint: Option<String>,
+    /// Local relay transport incarnation whose encrypted probe ACK confirmed
+    /// the endpoint.  A reconnect/renewal can reuse the same endpoint, so an
+    /// endpoint string alone cannot identify the connection that was proven.
+    pub relay_confirmed_connection_id: Option<u64>,
+    /// Relay-first startup/fallback business evidence state.
+    pub(crate) relay_first: RelayFirstBusinessState,
+    /// Monotonic relay-confirm sequence.  Bumped (and mirrored in the peer
+    /// manager, notified to outbound waiters) every time the peer's relay
+    /// confirmation changes, mirroring `direct_commit_seq`.
+    pub relay_confirm_seq: u64,
+    /// Local network generation of the first confirmed usable path
+    /// (`RelayPeerConfirmed` or `DirectConfirmed`), the first-business-packet
+    /// milestone.
+    pub first_usable_generation: Option<u64>,
+    /// Monotonic instant (daemon-local) of the first usable path milestone.
+    pub first_usable_at: Option<Instant>,
+    /// Which path became first usable.
+    pub first_usable_path: Option<NetworkPath>,
+    /// Short window after a local generation change where previous Direct peers
+    /// are reprobed aggressively before returning to normal retry backoff.
+    direct_reclaim_until: Option<Instant>,
+    /// Direct candidate-pair reachability table.
+    pub candidate_pairs: Vec<CandidatePair>,
+    /// Wide birthday rank committed by the last fully covered stable-side scan.
+    /// Candidate source refreshes and Probe-v2 rekeys intentionally preserve it.
+    birthday_probe_cursor: usize,
+    /// Last selector decision made for outbound peer traffic.
+    pub last_path_selection: Option<PathSelection>,
+    /// Recent real outbound path-selector transitions.
+    pub path_events: Vec<PathSelectionEvent>,
+    /// Recent direct traversal timeline events.
+    pub direct_events: Vec<DirectTraversalEvent>,
+    /// Shared synchronous Direct-set mirror owned by the PeerManager.  Kept in
+    /// lockstep from `transition` and `reset_for_identity_change`, so the UDP
+    /// dynamic-socket eviction can re-verify "is this peer Direct?" under its
+    /// own socket-state lock without awaiting the async manager there.
+    direct_cache: Option<Arc<std::sync::Mutex<HashSet<String>>>>,
+    /// Manager-owned lock-free snapshot of the exact pair selected by the
+    /// latest Direct commit. It is cleared with the Direct-set mirror on any
+    /// non-Direct transition so a generic state change cannot resurrect a
+    /// stale Hard↔Hard pair.
+    direct_pair_cache: Option<Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>>,
+    /// Manager-owned, no-await projection of the committed typed path state.
+    /// The validation harness and future observability consumers read this
+    /// instead of treating a contended diagnostics cache as path authority.
+    committed_business_path_cache:
+        Option<Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>>,
+    /// Change stream for the committed-path projection. It is notified only
+    /// after the reducer commit and its infallible side effects have completed
+    /// under the connection writer.
+    committed_business_path_change_tx: Option<tokio::sync::watch::Sender<u64>>,
+    /// Authoritative active-path telemetry hub.
+    telemetry_hub: Option<Arc<path_telemetry::PathTelemetryHub>>,
+}
+
+impl PeerConnection {
+    fn start_direct_first(&mut self, epoch: PathEpoch, policy: crate::config::PathPolicy) -> bool {
+        if policy == crate::config::PathPolicy::DirectFirst
+            && !self.path_state_machine.direct_first_configured()
+        {
+            return self
+                .commit_path_transition(
+                    PathEvent::DirectFirstStarted {
+                        epoch,
+                        now: Instant::now(),
+                    },
+                    |_| {},
+                )
+                .applies_side_effects();
+        }
+        false
+    }
+
+    fn advance_direct_first_deadline(&mut self, generation: u64) {
+        self.advance_direct_first_deadline_at(generation, Instant::now());
+    }
+
+    fn advance_direct_first_deadline_at(&mut self, generation: u64, now: Instant) -> bool {
+        if !self.path_state_machine.direct_first_deadline_due(now) {
+            return false;
+        }
+        if let Some(epoch) = self
+            .path_state_machine
+            .current_epoch()
+            .filter(|epoch| epoch.network_generation == generation)
+        {
+            return self
+                .commit_path_transition(PathEvent::DirectFirstDeadline { epoch, now }, |_| {})
+                .applies_side_effects();
+        }
+        false
+    }
+
+    fn direct_first_pending(&self) -> bool {
+        self.path_state_machine.direct_first_pending()
+    }
+
+    pub(crate) fn remote_candidate_epoch(&self) -> u64 {
+        self.remote_candidate_epoch
+    }
+
+    pub(crate) fn last_candidate_generation(&self) -> u64 {
+        self.last_candidate_generation
+    }
+
+    pub(crate) fn remote_nat_profile_matches_candidate_epoch(&self) -> bool {
+        self.remote_nat_profile_candidate_epoch == Some(self.remote_candidate_epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_remote_nat_profile_to_candidate_epoch(
+        &mut self,
+        profile_generation: u64,
+    ) -> bool {
+        matches!(
+            self.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(profile_generation),
+            RemoteNatProfileBindResult::Bound(_)
+        )
+    }
+
+    pub(crate) fn bind_remote_nat_profile_to_candidate_epoch_with_snapshot(
+        &mut self,
+        profile_generation: u64,
+    ) -> RemoteNatProfileBindResult {
+        let profile_present = self.remote_nat_profile.is_some();
+        let profile_generation_seen = self
+            .remote_nat_profile
+            .as_ref()
+            .and_then(|profile| profile.generation);
+        let profile_fresh = self.remote_nat_profile_is_fresh();
+        let snapshot = RemoteNatProfileBindSnapshot {
+            candidate_epoch: Some(self.remote_candidate_epoch),
+            profile_candidate_epoch: self.remote_nat_profile_candidate_epoch,
+            profile_present,
+            profile_generation: profile_generation_seen,
+            profile_fresh,
+            declared_generation: profile_generation,
+        };
+
+        let rejection = if !profile_present {
+            Some(RemoteNatProfileBindFailure::ProfileMissing)
+        } else if profile_generation_seen.is_none() {
+            Some(RemoteNatProfileBindFailure::ProfileGenerationMissing)
+        } else if !profile_fresh {
+            Some(RemoteNatProfileBindFailure::ProfileExpired)
+        } else if profile_generation_seen != Some(profile_generation) {
+            Some(RemoteNatProfileBindFailure::ProfileGenerationMismatch)
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            return RemoteNatProfileBindResult::Rejected { reason, snapshot };
+        }
+
+        self.remote_nat_profile_candidate_epoch = Some(self.remote_candidate_epoch);
+        RemoteNatProfileBindResult::Bound(snapshot)
+    }
+
+    pub(crate) fn set_local_interface_networks(&mut self, networks: Vec<LocalNetwork>) {
+        self.local_interface_networks = networks;
+    }
+
+    /// Accept a remote NAT hint only when it does not move the profile
+    /// generation backwards. Unversioned legacy labels remain useful as
+    /// display/diagnostic data, but cannot replace a versioned profile.
+    pub(crate) fn update_remote_nat_profile(
+        &mut self,
+        nat_type: &str,
+        stable_endpoint: Option<SocketAddr>,
+    ) -> bool {
+        let hint = parse_nat_hint(nat_type);
+        let incoming_generation = hint.profile_generation;
+        let incoming_lifecycle = hint.registration_lifecycle;
+        let incoming_observation = hint.observation_sequence;
+        let current_generation = self
+            .remote_nat_profile
+            .as_ref()
+            .and_then(|profile| profile.generation);
+        let current_lifecycle = self
+            .remote_nat_profile
+            .as_ref()
+            .and_then(|profile| profile.registration_lifecycle);
+        let current_observation = self
+            .remote_nat_profile
+            .as_ref()
+            .and_then(|profile| profile.observation_sequence);
+        let stable_endpoint =
+            stable_endpoint.filter(|endpoint| is_public_probe_endpoint(*endpoint));
+        let new_capabilities = NatCapabilities::from_fingerprint_hint(&hint, stable_endpoint);
+        // A server-issued registration lifecycle is the outermost ordering
+        // fence. A daemon restart may legitimately restart local `g` and `o`
+        // at low values, but an in-flight PATCH from the old registration must
+        // never replace the new profile. Once we have seen a lifecycle, a
+        // label that omits it cannot downgrade that protection.
+        let lifecycle_advanced = match (current_lifecycle, incoming_lifecycle) {
+            (Some(current), Some(incoming)) if incoming < current => {
+                debug!(
+                    peer = %self.node_id,
+                    current_lifecycle,
+                    incoming_lifecycle,
+                    "ignored stale remote NAT registration lifecycle"
+                );
+                return false;
+            }
+            (Some(_), None) => {
+                debug!(
+                    peer = %self.node_id,
+                    current_lifecycle,
+                    "ignored remote NAT label without the current registration lifecycle"
+                );
+                return false;
+            }
+            (Some(current), Some(incoming)) => incoming > current,
+            (None, _) => false,
+        };
+
+        let accepts = if lifecycle_advanced {
+            true
+        } else {
+            match (current_generation, incoming_generation) {
+                (Some(current), Some(incoming)) => {
+                    if incoming < current {
+                        false
+                    } else if incoming == current {
+                        if let Some(existing) = self.remote_nat_profile.as_ref() {
+                            let cur_m = existing.capabilities.mapping_behavior;
+                            let inc_m = new_capabilities.mapping_behavior;
+                            if cur_m != MappingBehavior::Unknown
+                                && inc_m != MappingBehavior::Unknown
+                                && cur_m != inc_m
+                            {
+                                return false;
+                            }
+                            let cur_f = existing.capabilities.filtering_behavior;
+                            let inc_f = new_capabilities.filtering_behavior;
+                            if cur_f != FilteringBehavior::Unknown
+                                && inc_f != FilteringBehavior::Unknown
+                                && cur_f != inc_f
+                            {
+                                return false;
+                            }
+                            let cur_a = &existing.capabilities.allocation_model;
+                            let inc_a = &new_capabilities.allocation_model;
+                            if cur_a.is_some() && inc_a.is_some() && cur_a != inc_a {
+                                return false;
+                            }
+                        }
+                        true
+                    } else {
+                        true
+                    }
+                }
+                (Some(_), None) => false,
+                (None, _) => true,
+            }
+        };
+        if !accepts {
+            debug!(
+                peer = %self.node_id,
+                current_generation = ?current_generation,
+                incoming_generation = ?incoming_generation,
+                "ignored stale or unversioned remote NAT profile"
+            );
+            return false;
+        }
+
+        // `o` is emitted only after a real successful STUN observation. It
+        // therefore renews the remote evidence age at a stable capability,
+        // while a heartbeat that replays the same cached label preserves the
+        // old age. The same-generation ordering is deliberate: a new `g` (or
+        // a new registration lifecycle) already represents a new capability
+        // snapshot and starts a fresh observation epoch.
+        let observation_advanced = !lifecycle_advanced
+            && current_generation == incoming_generation
+            && match (current_observation, incoming_observation) {
+                (Some(current), Some(incoming)) if incoming < current => {
+                    debug!(
+                        peer = %self.node_id,
+                        current_observation,
+                        incoming_observation,
+                        "ignored stale remote NAT observation"
+                    );
+                    return false;
+                }
+                (Some(_), None) => {
+                    debug!(
+                        peer = %self.node_id,
+                        current_observation,
+                        "ignored remote NAT label without the current observation fence"
+                    );
+                    return false;
+                }
+                (Some(current), Some(incoming)) => incoming > current,
+                (None, Some(_)) => true,
+                (None, None) => false,
+            };
+        let received_at_ms = if let Some(existing) = self.remote_nat_profile.as_ref() {
+            if !lifecycle_advanced
+                && !observation_advanced
+                && existing.generation == incoming_generation
+                && existing.capabilities.mapping_behavior == new_capabilities.mapping_behavior
+                && existing.capabilities.filtering_behavior == new_capabilities.filtering_behavior
+                && existing.capabilities.allocation_model == new_capabilities.allocation_model
+            {
+                // Identical capability at same generation (e.g. heartbeat republishing cached NAT):
+                // Retain existing observation timestamp to avoid infinite pseudo-freshness.
+                existing.received_at_ms
+            } else {
+                nat_profile_now_ms()
+            }
+        } else {
+            nat_profile_now_ms()
+        };
+        self.remote_nat_profile = Some(RemoteNatProfile {
+            capabilities: new_capabilities,
+            generation: incoming_generation,
+            registration_lifecycle: incoming_lifecycle,
+            observation_sequence: incoming_observation,
+            received_at_ms,
+        });
+        self.remote_nat_profile_candidate_epoch = Some(self.remote_candidate_epoch);
+        debug!(
+            event = "remote_nat_profile_updated",
+            peer = %self.node_id,
+            remote_registration_lifecycle = ?incoming_lifecycle,
+            remote_profile_generation = ?incoming_generation,
+            remote_observation_sequence = ?incoming_observation,
+            mapping_behavior = ?hint.mapping,
+            filtering_behavior = ?hint.filtering,
+            prediction_confidence = ?hint.confidence,
+            "accepted remote NAT capability hint"
+        );
+        true
+    }
+
+    pub(crate) fn remote_nat_profile_is_fresh(&self) -> bool {
+        self.remote_nat_profile.as_ref().is_some_and(|profile| {
+            profile.is_fresh(nat_profile_now_ms(), REMOTE_NAT_PROFILE_MAX_AGE)
+        })
+    }
+
+    /// Create a new peer connection in Idle state.
+    pub fn new(node_id: &str, virtual_ip: &str) -> Self {
+        Self {
+            node_id: node_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
+            public_key: String::new(),
+            probe_mac_key: None,
+            probe_session_id: None,
+            probe_ephemeral_shared: None,
+            probe_binding_token: None,
+            pending_probe_bindings: HashMap::new(),
+            previous_probe_binding: None,
+            virtual_ip: virtual_ip.to_string(),
+            endpoint: None,
+            signaled_endpoint: None,
+            nat_type: String::new(),
+            remote_nat_profile: None,
+            remote_nat_profile_candidate_epoch: None,
+            online: true,
+            last_seen: 0,
+            remote_relay_rtt_ms: None,
+            state: ConnectionState::Idle,
+            path_state_machine: PathStateMachine::new(ConnectionState::Idle),
+            path_observability: PathObservabilityState::default(),
+            connected_at: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+            relay_server: None,
+            candidates: Vec::new(),
+            signaled_candidates: HashSet::new(),
+            last_candidate_generation: 0,
+            remote_candidate_incarnation_high_water: None,
+            remote_candidate_epoch: 0,
+            local_interface_networks: Vec::new(),
+            last_candidates_expires_at_ms: None,
+            candidate_sources: HashMap::new(),
+            direct_health: PathHealth::default(),
+            relay_health: PathHealth::default(),
+            direct_generation: 0,
+            direct_commit_seq: 0,
+            relay_ready_generation: None,
+            relay_ready_at: None,
+            relay_ready_endpoint: None,
+            relay_ready_connection_id: None,
+            relay_confirmed_generation: None,
+            relay_confirmed_at: None,
+            relay_confirmed_endpoint: None,
+            relay_confirmed_connection_id: None,
+            relay_first: RelayFirstBusinessState::default(),
+            relay_confirm_seq: 0,
+            first_usable_generation: None,
+            first_usable_at: None,
+            first_usable_path: None,
+            direct_reclaim_until: None,
+            candidate_pairs: Vec::new(),
+            birthday_probe_cursor: 0,
+            last_path_selection: None,
+            path_events: Vec::new(),
+            direct_events: Vec::new(),
+            direct_cache: None,
+            direct_pair_cache: None,
+            committed_business_path_cache: None,
+            committed_business_path_change_tx: None,
+            telemetry_hub: None,
+        }
+    }
+
+    fn reset_for_identity_change(&mut self) {
+        self.commit_path_transition(PathEvent::IdentityReset, |conn| {
+            conn.endpoint = conn.signaled_endpoint;
+            conn.remote_nat_profile = None;
+            conn.remote_nat_profile_candidate_epoch = None;
+            conn.probe_session_id = None;
+            conn.probe_ephemeral_shared = None;
+            conn.probe_binding_token = None;
+            conn.pending_probe_bindings.clear();
+            conn.previous_probe_binding = None;
+            conn.candidates.clear();
+            conn.signaled_candidates.clear();
+            conn.last_candidate_generation = 0;
+            conn.remote_candidate_incarnation_high_water = None;
+            conn.remote_candidate_epoch = 0;
+            conn.last_candidates_expires_at_ms = None;
+            conn.candidate_sources.clear();
+            conn.relay_server = None;
+            conn.direct_health = PathHealth::default();
+            conn.relay_health = PathHealth::default();
+            conn.direct_generation = 0;
+            conn.direct_reclaim_until = None;
+            conn.relay_ready_generation = None;
+            conn.relay_ready_at = None;
+            conn.relay_ready_endpoint = None;
+            conn.relay_ready_connection_id = None;
+            conn.relay_confirmed_generation = None;
+            conn.relay_confirmed_at = None;
+            conn.relay_confirmed_endpoint = None;
+            conn.relay_confirmed_connection_id = None;
+            conn.relay_first = RelayFirstBusinessState::default();
+            conn.first_usable_generation = None;
+            conn.first_usable_at = None;
+            conn.first_usable_path = None;
+            conn.candidate_pairs.clear();
+            conn.birthday_probe_cursor = 0;
+            conn.last_path_selection = None;
+            conn.path_events.clear();
+            conn.direct_events.clear();
+        });
+    }
+
+    /// Reset all transport/path state for a new remote daemon session while
+    /// retaining the peer's long-lived identity and Probe MAC key.
+    ///
+    /// A remote daemon incarnation change is stronger than a candidate refresh:
+    /// the old WireGuard session may still contain a high counter and the old
+    /// relay confirmation may still be accepted by local path selection, even
+    /// though the remote daemon that owned them has gone away. The caller must
+    /// first stop the transport/UDP workers, then use this reset before starting
+    /// the replacement handshake.
+    pub(crate) fn reset_for_peer_session(&mut self) {
+        let incarnation_high_water = self.remote_candidate_incarnation_high_water;
+        let candidate_generation_replay_floor = self.last_candidate_generation;
+        self.reset_for_identity_change();
+        self.remote_candidate_incarnation_high_water = incarnation_high_water;
+        self.last_candidate_generation = candidate_generation_replay_floor;
+    }
+
+    /// Whether the connection is active (direct or relay).
+    pub fn is_active(&self) -> bool {
+        self.path_state_machine.active_path().is_some()
+    }
+
+    /// Whether the connection is via relay.
+    pub fn is_relay(&self) -> bool {
+        self.path_state_machine.active_path() == Some(NetworkPath::Relay)
+    }
+
+    /// Transition to a new state.
+    pub fn transition(&mut self, new_state: ConnectionState) {
+        let epoch = self.path_state_machine.current_epoch().unwrap_or_else(|| {
+            PathEpoch::unbound(self.direct_generation, self.remote_candidate_epoch)
+        });
+        self.commit_path_transition(
+            PathEvent::CompatibilityStateRequested {
+                epoch,
+                state: new_state,
+                direct_endpoint: self.endpoint,
+                relay_endpoint: self
+                    .relay_confirmed_endpoint
+                    .clone()
+                    .or_else(|| self.relay_ready_endpoint.clone())
+                    .or_else(|| self.relay_server.clone()),
+                relay_connection_id: self
+                    .relay_confirmed_connection_id
+                    .or(self.relay_ready_connection_id),
+            },
+            |_| {},
+        );
+    }
+
+    /// The sole commit point for authoritative active-path changes and their
+    /// compatibility/transport side effects. The pure reducer runs first; a
+    /// rejected event therefore executes no side effects, while an accepted
+    /// transition and its infallible mutation closure commit under the same
+    /// `PeerConnection` writer guard.
+    pub(crate) fn commit_path_transition(
+        &mut self,
+        event: PathEvent,
+        apply_side_effects: impl FnOnce(&mut Self),
+    ) -> PathTransitionOutcome {
+        let event_epoch = event.epoch();
+        let observability_event = event.clone();
+        let previous_active = self.path_state_machine.active_path();
+        let previous_state = self.state;
+        let transition = self.path_state_machine.reduce(event);
+        let outcome = self.path_state_machine.commit(transition);
+        self.path_observability
+            .record(&observability_event, &outcome, Instant::now());
+        if !outcome.accepted() {
+            debug!(
+                target: "p2pnet_daemon::peer::path_state_machine",
+                event = "path_transition_rejected",
+                peer_id = %self.node_id,
+                epoch = ?event_epoch,
+                decision = ?outcome.decision,
+                revision = outcome.snapshot.revision,
+                "rejected stale or illegal path event"
+            );
+            return outcome;
+        }
+        if !outcome.applies_side_effects() {
+            debug!(
+                target: "p2pnet_daemon::peer::path_state_machine",
+                event = "path_transition_duplicate",
+                peer_id = %self.node_id,
+                epoch = ?event_epoch,
+                decision = ?outcome.decision,
+                revision = outcome.snapshot.revision,
+                "ignored duplicate path event without executing side effects"
+            );
+            return outcome;
+        }
+
+        // Publish the compatibility projection before the closure so legacy
+        // selector helpers observe the newly committed path; the connection
+        // writer keeps this transaction externally atomic. A reducer or
+        // revision rejection has already returned without running the closure.
+        let current_active = outcome.snapshot.state.active.network_path();
+        let new_state = outcome.snapshot.state.compatibility_state;
+        self.state = new_state;
+        apply_side_effects(self);
+
+        if previous_active.is_none() && current_active.is_some() {
+            self.connected_at = Some(Instant::now());
+        } else if current_active.is_none() {
+            self.connected_at = None;
+        } else if self.connected_at.is_none() {
+            self.connected_at = Some(Instant::now());
+        }
+        self.sync_direct_cache();
+        self.sync_committed_business_path_cache();
+        self.sync_direct_pair_cache();
+        self.sync_path_telemetry();
+
+        if previous_state != new_state || previous_active != current_active {
+            info!(target: "p2pnet_daemon::peer::connection",
+                event = "peer_connection_state_changed",
+                peer_id = %self.node_id,
+                previous_state = ?previous_state,
+                new_state = ?new_state,
+                previous_active_path = ?previous_active,
+                active_path = ?current_active,
+                path_revision = outcome.snapshot.revision,
+                direct_generation = self.direct_generation,
+                relay_ready_generation = ?self.relay_ready_generation,
+                relay_confirmed_generation = ?self.relay_confirmed_generation,
+                relay_confirmed_connection_id = ?self.relay_confirmed_connection_id,
+                relay_server = ?self.relay_server,
+                direct_endpoint = ?self.endpoint,
+                "peer connection state changed peer_id={} previous={:?} new={:?}",
+                self.node_id,
+                previous_state,
+                new_state,
+            );
+            info!(
+                "Peer {} state: {} → {}",
+                self.node_id, previous_state, new_state
+            );
+        }
+        outcome
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn path_state_snapshot(&self) -> PathStateMachineSnapshot {
+        self.path_state_machine.snapshot()
+    }
+
+    /// Keep the manager's synchronous Direct-set mirror in lockstep with this
+    /// connection's state, so the UDP layer can re-verify the nonevictable
+    /// set inside its socket-state lock.
+    fn sync_direct_cache(&self) {
+        if let Some(cache) = &self.direct_cache {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.state == ConnectionState::Direct {
+                cache.insert(self.node_id.clone());
+            } else {
+                cache.remove(&self.node_id);
+            }
+        }
+    }
+
+    /// Final exact-pair projection of the same authoritative transition. A
+    /// pending Direct commit has no active revision until the other path
+    /// mirrors above are published; invalidation removes the entire tuple.
+    fn sync_direct_pair_cache(&self) {
+        if let Some(cache) = &self.direct_pair_cache {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let path = self.path_state_machine.snapshot();
+            let current = cache.get_mut(&self.node_id).filter(|pair| {
+                self.online
+                    && self.state == ConnectionState::Direct
+                    && self.direct_generation == pair.generation
+                    && self.remote_candidate_epoch() == pair.remote_candidate_epoch
+                    && path.state.lifecycle == PeerPathLifecycle::Online
+                    && path.state.epoch
+                        == Some(PathEpoch::new(
+                            pair.generation,
+                            pair.peer_session_generation,
+                            pair.remote_candidate_epoch,
+                        ))
+                    && matches!(&path.state.active, ActiveBusinessPath::Direct(validation)
+                        if validation.epoch == path.state.epoch.expect("matched epoch")
+                            && validation.commit_endpoint() == Some(pair.remote_endpoint))
+                    && self.endpoint == Some(pair.remote_endpoint)
+            });
+            if let Some(pair) = current {
+                // Keep the exact commit projection in step with every typed
+                // path transition, including Direct-preserving observations.
+                pair.path_revision = Some(path.revision);
+            } else {
+                cache.remove(&self.node_id);
+            }
+        }
+    }
+
+    /// Attach the manager's synchronous Direct-set mirror (manager-owned).
+    pub(crate) fn attach_direct_cache(&mut self, cache: Arc<std::sync::Mutex<HashSet<String>>>) {
+        self.direct_cache = Some(cache);
+        self.sync_direct_cache();
+    }
+
+    /// Attach the manager's synchronous exact Direct-pair mirror.
+    pub(crate) fn attach_direct_pair_cache(
+        &mut self,
+        cache: Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>,
+    ) {
+        self.direct_pair_cache = Some(cache);
+        self.sync_direct_pair_cache();
+    }
+
+    fn sync_committed_business_path_cache(&self) {
+        let Some(cache) = &self.committed_business_path_cache else {
+            return;
+        };
+        let path = self.path_state_machine.snapshot().state;
+        let snapshot = CommittedBusinessPathSnapshot {
+            peer_id: self.node_id.clone(),
+            virtual_ip: self.virtual_ip.clone(),
+            lifecycle: path.lifecycle,
+            epoch: path.epoch,
+            active: path.active,
+        };
+        let changed = {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache
+                .insert(self.node_id.clone(), snapshot.clone())
+                .as_ref()
+                != Some(&snapshot)
+        };
+        if changed {
+            if let Some(changes) = &self.committed_business_path_change_tx {
+                changes.send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+            }
+        }
+    }
+
+    /// Attach the manager's typed committed-path mirror and its lossless latest
+    /// value notification stream.
+    pub(crate) fn attach_committed_business_path_cache(
+        &mut self,
+        cache: Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
+        changes: tokio::sync::watch::Sender<u64>,
+    ) {
+        self.committed_business_path_cache = Some(cache);
+        self.committed_business_path_change_tx = Some(changes);
+        self.sync_committed_business_path_cache();
+    }
+
+    /// Attach the active-path telemetry hub.
+    pub(crate) fn attach_telemetry_hub(&mut self, hub: Arc<path_telemetry::PathTelemetryHub>) {
+        self.telemetry_hub = Some(hub);
+        self.sync_path_telemetry();
+    }
+
+    /// Synchronize authoritative active-path state to the telemetry hub.
+    pub(crate) fn sync_path_telemetry(&self) {
+        if let Some(hub) = &self.telemetry_hub {
+            let snapshot = self.path_observability.snapshot(self);
+            hub.enqueue(&self.node_id, &snapshot);
+        }
+    }
+
+    /// Current selected traffic path, if active.
+    pub fn active_path(&self) -> Option<NetworkPath> {
+        self.path_state_machine.active_path()
+    }
+
+    /// Record bytes sent.
+    pub fn record_sent(&mut self, n: u64) {
+        self.bytes_sent += n;
+    }
+
+    /// Record bytes received.
+    pub fn record_received(&mut self, n: u64) {
+        self.bytes_received += n;
+    }
+
+    /// Record the first usable production ingress for this peer + generation.
+    ///
+    /// `path` is `Direct` or `Relay`.  The manager caller must supply the
+    /// authenticated ingress of a normal decrypted overlay business packet;
+    /// path confirmation and transport-local events are not substitutes for
+    /// that evidence.  The validation harness may impose an additional
+    /// bidirectional nonce/echo requirement before calling this method.
+    /// Emits exactly once per peer + generation; later calls in the same
+    /// generation no-op.
+    pub fn record_first_usable(&mut self, path: NetworkPath, generation: u64) -> bool {
+        if self.first_usable_generation == Some(generation) && self.first_usable_at.is_some() {
+            return false;
+        }
+        self.first_usable_generation = Some(generation);
+        self.first_usable_at = Some(Instant::now());
+        self.first_usable_path = Some(path);
+        true
+    }
+}
+
+fn nat_profile_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}

@@ -1,0 +1,146 @@
+# P2WLAN Flutter Client
+
+Flutter frontend for the Rust P2WLAN client, paired with the Rust networking
+core.
+
+The supported toolchain is Flutter 3.47.2 with Dart 3.13.2. The repository-root
+`.fvmrc` is the source of truth for local FVM, CI, and release builds.
+Public client support covers Windows, macOS 12+, Linux, and Android API 24+.
+iOS is outside the current support scope; retained iOS build files do not imply
+a supported public client.
+
+The split is:
+
+- Flutter: desktop/mobile UI, settings, status, peer views, and lifecycle
+  controls. It exits normally when its window is closed in the default desktop
+  flow.
+- Rust `p2wlan-tray`: tiny native tray process for idle status, opening the
+  Flutter UI on demand, and quick daemon controls without keeping WebView or
+  Flutter UI memory resident.
+- Rust `p2wlan-daemon`: virtual adapter, routes, crypto, NAT traversal, relay,
+  control-plane session, diagnostics, and shutdown.
+
+## Run
+
+For a configured macOS development checkout, use the one-command launcher. It
+builds and verifies the matching Rust daemon, then launches the normal Flutter
+app. Start and stop the daemon from Home or the system tray:
+
+```bash
+./apps/flutter_client/scripts/run_test_app_macos.sh
+```
+
+Clicking **Start P2WLAN** can show the normal macOS administrator prompt. A
+fresh checkout still goes through login and onboarding. Use `--dry-run` to
+build and print the resolved launch command without opening the app.
+
+Equivalent manual commands:
+
+```bash
+# Build the daemon binary used by the Flutter desktop client.
+cargo build -p p2wlan-daemon
+
+# Run the lightweight menu bar / tray controller.
+cargo build -p p2wlan-tray
+target/debug/p2wlan-tray
+
+# Run Flutter.
+cd apps/flutter_client
+P2WLAN_DAEMON_BIN=../../target/debug/p2wlan-daemon \
+flutter run -d macos
+```
+
+The packaged desktop app uses the in-process Flutter tray by default, so the
+macOS menu bar, Windows notification area, and Linux panel always have a
+visible P2WLAN entry. For the low-idle-memory native-tray experiment, set
+`P2WLAN_ENABLE_FLUTTER_TRAY=0` and launch `p2wlan-tray` separately.
+
+The client looks for `p2wlan-daemon` in this order:
+
+1. `P2WLAN_DAEMON_BIN`
+2. Side-by-side with the app executable
+3. macOS `.app/Contents/Resources/p2wlan-daemon`
+4. Workspace `target/debug` or `target/release`
+5. `PATH`
+
+On macOS, starting P2WLAN from the app requests administrator authorization so
+`p2wlan-daemon` can create `utun` and install routes. Stop first tries
+`POST /shutdown`, then falls back to a verified PID marker.
+
+## macOS Bundle
+
+The macOS Runner has a build phase that runs:
+
+```bash
+apps/flutter_client/scripts/bundle_daemon_macos.sh
+```
+
+It rebuilds `p2wlan-daemon` for Debug/Release and verifies its version and git
+commit before copying it into the app bundle Resources directory. This avoids
+silently embedding a stale daemon from `target/`.
+
+Build the release Flutter DMG, including a freshly compiled Rust daemon, with:
+
+```bash
+apps/flutter_client/scripts/package_macos.sh
+```
+
+The artifact is written under `target/flutter/release/`.
+
+## Diagnostics
+
+The default diagnostics URL is:
+
+```text
+http://127.0.0.1:39277/status
+```
+
+The app uses:
+
+- `GET /health` for lightweight reachability checks
+- `GET /status` for runtime snapshots
+- `POST /shutdown` for graceful daemon stop
+
+## Memory Snapshot
+
+Measure the Flutter UI separately from the Rust daemon:
+
+```bash
+apps/flutter_client/scripts/memory_baseline_macos.sh
+```
+
+Use `CORE_PATTERN` only when you explicitly want a combined UI + daemon number.
+
+For the intended low-idle-memory desktop flow, run `p2wlan-tray` and close the
+Flutter window when the dashboard is not needed:
+
+```bash
+cargo build -p p2wlan-tray
+target/debug/p2wlan-tray
+```
+
+## Validate
+
+```bash
+cd apps/flutter_client
+flutter analyze
+flutter test
+flutter build macos --release
+
+cd ../..
+cargo check -p p2wlan-daemon
+```
+
+## Acceptance Checklist
+
+- [x] Flutter exposes `p2wlan-daemon` start from Dashboard.
+- [x] Flutter exposes daemon stop through `/shutdown` with PID fallback.
+- [x] Dashboard, Diagnostics, and Nodes update from `/status`.
+- [x] Flutter in-process tray is enabled by default in packaged desktop apps;
+  `P2WLAN_ENABLE_FLUTTER_TRAY=0` selects the separate native tray experiment.
+- [x] Rust `p2wlan-tray` builds as a lightweight idle tray companion.
+- [ ] macOS release app bundles `p2wlan-daemon` in Resources and passes local
+  notarization/signing smoke.
+- [ ] Windows UAC, Linux elevation, and packaged tray behavior pass live smoke.
+- [ ] Flutter UI RSS is measured separately from daemon RSS.
+- [x] Flutter is the primary desktop client path.

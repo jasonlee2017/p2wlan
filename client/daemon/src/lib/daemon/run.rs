@@ -1,0 +1,633 @@
+impl Daemon {
+    /// Run the daemon main loop.
+    pub async fn run(&mut self) -> Result<()> {
+        info!("P2WLAN daemon v{} starting...", env!("CARGO_PKG_VERSION"));
+        #[cfg(target_os = "android")]
+        self.spawn_android_network_change_control_watcher().await;
+        let build = crate::build_info::current();
+        info!(
+            event = "daemon_build_identity",
+            version = %build.app_version,
+            git_commit = %build.git_commit,
+            build_id = %build.build_id,
+            binary_sha256 = %build.binary_sha256,
+            binary_path = %build.binary_path,
+            "daemon_build_identity version={} git_commit={} build_id={} binary_sha256={}",
+            build.app_version,
+            build.git_commit,
+            build.build_id,
+            build.binary_sha256,
+        );
+        info!("Node ID: {}", self.config.node.node_id);
+        info!(
+            "Network: {} ({})",
+            self.config.network.network_id, self.config.network.cidr
+        );
+        info!("Control server: {}", self.config.control.server_url);
+        info!(
+            "Control plane proxy mode: {} (HTTP {}; WebSocket signaling is always direct-only)",
+            self.config.control.proxy_mode.as_label(),
+            crate::control::proxy_http_behavior_label(self.config.control.proxy_mode)
+        );
+        if self.config.network.hard_hard_experiment_only {
+            info!(
+                event = "hard_hard_experiment_lane_enabled",
+                "Hard↔Hard experiment lane enabled: ordinary candidate offers and punch workers are isolated"
+            );
+        }
+        self.timeline.emit(
+            "daemon_started",
+            None,
+            None,
+            Some(format!(
+                "node_id={} boot_epoch_ms={}",
+                self.config.node.node_id, self.boot_epoch_ms
+            )),
+        );
+
+        let mut virtual_ip = self.config.network.virtual_ip.clone();
+        let mut netmask = self.config.network.netmask.clone();
+        let mut cidr = self.config.network.cidr.clone();
+        let mut assigned_node_id = self.config.node.node_id.clone();
+        let mut relay_servers = self.config.relay.servers.clone();
+        let mut relay_catalog = Vec::new();
+
+        if !self.config.network.manual {
+            info!("Running in managed mode. Waiting for control plane registration...");
+            // The Android VPN fd is already owned by this Daemon while the
+            // control plane is registering. A disconnected/expired session
+            // used to leave this await uninterruptible, so STOP could not
+            // release the native runtime and the next START saw a stale TUN.
+            loop {
+                let event = tokio::select! {
+                    changed = self.shutdown_rx.changed() => {
+                        if changed.is_err() || *self.shutdown_rx.borrow() {
+                            info!("Shutdown requested while waiting for control plane registration");
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    event = self.control_rx.recv() => event,
+                };
+                let Some(event) = event else {
+                    break;
+                };
+                match event {
+                    ControlEvent::Registered {
+                        node_id,
+                        virtual_ip: vip,
+                        cidr: dyn_cidr,
+                        relay_servers: rs,
+                        relay_catalog: catalog,
+                    } => {
+                        info!("Control plane registration confirmed. Assigned IP: {}", vip);
+                        self.health.mark_control_success().await;
+
+                        // Validate virtual IP
+                        if vip.parse::<std::net::Ipv4Addr>().is_err() {
+                            return Err(DaemonError::Network(format!(
+                                "Server returned invalid virtual IP: {}",
+                                vip
+                            )));
+                        }
+
+                        // Validate CIDR
+                        let actual_cidr = dyn_cidr.unwrap_or_else(|| "10.20.0.0/16".to_string());
+                        if !is_ip_in_cidr(&vip, &actual_cidr) {
+                            return Err(DaemonError::Network(format!(
+                                "Server returned virtual IP {} that is outside network CIDR {}",
+                                vip, actual_cidr
+                            )));
+                        }
+
+                        #[cfg(target_os = "android")]
+                        if self.config.network.network_id.starts_with("room-")
+                            && (vip != self.config.network.virtual_ip
+                                || actual_cidr != self.config.network.cidr)
+                        {
+                            return Err(DaemonError::Config(
+                                "room address changed after Android VPN preparation; reconnect the room".into(),
+                            ));
+                        }
+
+                        virtual_ip = vip;
+                        if let Some(derived_mask) = cidr_to_netmask(&actual_cidr) {
+                            netmask = derived_mask;
+                        }
+                        cidr = actual_cidr;
+                        if let Some(nid) = node_id {
+                            assigned_node_id = nid;
+                        }
+                        if !rs.is_empty() {
+                            relay_servers = rs;
+                        }
+                        if !catalog.is_empty() {
+                            relay_catalog = catalog;
+                        }
+                        if relay_servers.is_empty() && relay_catalog.is_empty() {
+                            relay_servers =
+                                infer_default_relay_servers(&self.config.control.server_url);
+                        }
+
+                        break;
+                    }
+                    ControlEvent::ServerError { code, message } => {
+                        return Err(DaemonError::ControlPlane(format!(
+                            "Server returned error code {code}: {message}"
+                        )));
+                    }
+                    ControlEvent::ReauthRequired { message } => {
+                        return Err(DaemonError::Auth(message));
+                    }
+                    _ => {
+                        warn!("Received event before registration, ignoring: {:?}", event);
+                    }
+                }
+            }
+        } else {
+            info!("Running in manual/offline mode. Using local configurations.");
+        }
+
+        let relay_allow_insecure_plaintext = effective_relay_allow_insecure_plaintext(
+            &self.config.control.server_url,
+            &relay_catalog,
+            &relay_servers,
+            self.config.relay.allow_insecure_plaintext,
+        );
+        if relay_allow_insecure_plaintext && !self.config.relay.allow_insecure_plaintext {
+            info!(
+                "Allowing plaintext relay because HTTP control plane supplied legacy relay candidates"
+            );
+        }
+
+        let mut resolved_config = (*self.config).clone();
+        resolved_config.network.virtual_ip = virtual_ip.clone();
+        resolved_config.network.netmask = netmask.clone();
+        resolved_config.network.cidr = cidr.clone();
+        resolved_config.node.node_id = assigned_node_id.clone();
+        resolved_config.relay.servers = relay_servers.clone();
+        resolved_config.relay.allow_insecure_plaintext = relay_allow_insecure_plaintext;
+        resolved_config.network.udp_observers =
+            udp_observers_from_sources(&relay_catalog, &resolved_config.network.udp_observers);
+        self.config = Arc::new(resolved_config);
+        self.peers
+            .set_local_node_id_for_traversal(&assigned_node_id);
+
+        info!(
+            "[startup] initializing TUN: interface={} address={} netmask={} mtu={}",
+            self.config.network.interface, virtual_ip, netmask, self.config.network.mtu
+        );
+        // Initialize TUN using the resolved IP details
+        let tun = self.init_tun_with(&virtual_ip, &netmask, self.config.network.mtu)?;
+        if let Some(ref tun) = tun {
+            self.route_manager.set_interface(tun.name().to_string());
+        }
+
+        // Detect ambient proxy / TUN-capture environments before any STUN
+        // or relay traffic.  A proxied egress makes the observed public
+        // endpoint meaningless and explains UdpBlocked profiles on an
+        // otherwise healthy broadband line (e.g. a Clash/Surge TUN client
+        // egressing STUN through a Tencent-OpenedSNS tunnel instead of the
+        // operator's own NAT).  The daemon still runs, but the NAT verdict
+        // is reported with that context.
+        let excluded_interfaces = tun
+            .as_ref()
+            .map(|tun| vec![tun.name().to_string()])
+            .unwrap_or_default();
+        let detection_excluded_interfaces = excluded_interfaces.clone();
+        let proxy_env = tokio::task::spawn_blocking(move || {
+            crate::netenv::detect_proxy_environment(&detection_excluded_interfaces)
+        })
+        .await
+        .map_err(|error| {
+            DaemonError::Network(format!(
+                "network environment detection task failed: {error}"
+            ))
+        })?;
+        if proxy_env.intercepted() {
+            warn!(
+                "Network egress appears intercepted: verdict={} env_proxy_count={} system_proxy={:?} default_route_interface={:?} public_route_interfaces={:?} capture_interface={:?} physical_bypass_interface={:?}",
+                proxy_env.label(),
+                proxy_env.env_proxies.len(),
+                proxy_env.system_proxy,
+                proxy_env.default_route_interface,
+                proxy_env.public_route_interfaces,
+                proxy_env.capture_iface,
+                proxy_env.physical_route_interface,
+            );
+        } else {
+            info!(
+                "Network egress checked: verdict={} default_route_interface={:?}",
+                proxy_env.label(),
+                proxy_env.default_route_interface,
+            );
+        }
+
+        // Install overlay route. Route errors are startup-fatal and must not
+        // be hidden behind a later diagnostics timeout.
+        info!(
+            "[route] installing {cidr} via {}",
+            self.route_manager.current_interface()
+        );
+        if let Err(error) = self.route_manager.add_cidr_route(&cidr) {
+            error!("[route] install failed for {cidr}: {error}");
+            self.route_manager.cleanup();
+            return Err(DaemonError::Network(format!(
+                "route install failed: {error}"
+            )));
+        }
+        info!("[route] installed {cidr}");
+
+        let Some(outbound_rx) = self.outbound_rx.take() else {
+            return Err(DaemonError::Network(
+                "outbound packet receiver already attached".to_string(),
+            ));
+        };
+        let (network_inbound_tx, network_inbound_rx) = mpsc::channel(1024);
+
+        // Relay setup is the availability path.  Start it immediately after
+        // control registration/TUN setup, before any best-effort STUN DNS
+        // resolution.  The previous order resolved the default STUN hostnames
+        // serially here; on Mini two 1-second resolver timeouts delayed relay
+        // selection by ~4.1s even though the control plane and relay were
+        // already reachable.  Direct candidate gathering remains in its own
+        // task below and can publish/upgrade after relay is serving.
+        let relay_candidates = relay_candidates_from_sources(&relay_catalog, &relay_servers);
+        let relay_candidates_present = !relay_candidates.is_empty();
+        // Arm the per-peer relay-first standby state before either Direct
+        // validation or the relay supervisor can publish a transport. An
+        // authoritative Direct ACK that arrives during relay startup still
+        // promotes Direct; the relay state remains available for fallback.
+        self.peers
+            .configure_relay_first(relay_candidates_present)
+            .await;
+        let mut relay_started = false;
+        if relay_candidates_present {
+            relay_started = true;
+            spawn_relay_inbound(RelayInboundSpawnContext {
+                task_manager: self.task_manager.clone(),
+                relay_candidates,
+                preferred_regions: self.config.relay.preferred_regions.clone(),
+                selection_timeout: Duration::from_millis(
+                    self.config.relay.selection_timeout_ms.max(1),
+                ),
+                node_id: assigned_node_id.clone(),
+                peers: self.peers.clone(),
+                relay_transport: self.relay_transport.clone(),
+                relay_selection: self.relay_selection.clone(),
+                relay_available_tx: self.relay_available_tx.clone(),
+                timeline: self.timeline.clone(),
+                inbound_tx: network_inbound_tx.clone(),
+                control: self.control.clone(),
+                android_network_change_rx: self.android_network_change_relay_rx.clone(),
+                allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,
+                ca_cert_path: self.config.relay.ca_cert_path.clone(),
+            })
+            .await;
+        } else {
+            debug!("No relay servers configured; direct UDP only unless peers provide relay later");
+        }
+
+        let udp_bind = self.config.network.udp_bind.parse().map_err(|e| {
+            DaemonError::Config(format!(
+                "invalid network.udp_bind '{}': {e}",
+                self.config.network.udp_bind
+            ))
+        })?;
+        let udp_advertise = self.config.network.udp_advertise.clone();
+        let stun_timeout = Duration::from_millis(self.config.network.stun_timeout_ms);
+        // Resolve both STUN source lists concurrently.  A failing resolver
+        // deadline is Direct-only best effort and must not stall the control
+        // event loop: two serial 1-second timeouts here delayed roster/offer
+        // ingress (and direct validation) behind relay readiness
+        // (field evidence: fresh_mapping acceptance round with two
+        // stun.l.google.com resolution timeouts pushing the event loop 2s
+        // after peer join was already polled).
+        let (resolved_stun, resolved_observers) = tokio::join!(
+            parse_stun_servers(&self.config.network.stun_servers, stun_timeout),
+            async {
+                if self.config.network.udp_observers.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    parse_stun_servers(&self.config.network.udp_observers, stun_timeout).await
+                }
+            },
+        );
+        let mut stun_servers = resolved_stun?;
+        let udp_observers = resolved_observers?;
+        for observer in &udp_observers {
+            if !stun_servers.contains(observer) {
+                stun_servers.push(*observer);
+            }
+        }
+        if stun_servers.is_empty() {
+            info!("STUN/UDP-observer candidate gathering is disabled");
+        } else if udp_observers.is_empty() {
+            info!("Using STUN endpoints: {stun_servers:?}");
+        } else {
+            info!("Using STUN/UDP observer endpoints: stun_and_observers={stun_servers:?} observers={udp_observers:?}");
+        }
+        *self.runtime_stun_servers.write().await = stun_servers.clone();
+        *self.runtime_stun_timeout.write().await = stun_timeout;
+        let configured_keepalive = Duration::from_secs(self.config.network.keepalive_interval_secs);
+        let keepalive_interval = if configured_keepalive.is_zero() {
+            Duration::ZERO
+        } else {
+            configured_keepalive.min(DIRECT_LIVENESS_INTERVAL_MAX)
+        };
+        let upnp_enabled = self.config.network.upnp_enabled;
+        let socket_pool_enabled = self.config.network.socket_pool_enabled;
+        let socket_pool_size = self.config.network.socket_pool_size;
+        let prefer_direct = self.config.relay.prefer_direct;
+        let punch_interval = Duration::from_millis(self.config.network.punch_interval_ms);
+        let punch_attempts = self.config.network.punch_attempts;
+
+        let relay_startup_wait = RelayStartupWait {
+            relay_expected: relay_candidates_present,
+            timeout: self
+                .config
+                .relay
+                .startup_wait_timeout(relay_candidates_present),
+        };
+        let relay_available_rx = self.relay_available_tx.subscribe();
+        // Kick signal for the forced-relay probe loop: bumped by the outbound
+        // actor when a first business packet starts waiting (or a relay comes
+        // up), so the probe fires immediately instead of waiting for the next
+        // poll tick.
+        let relay_probe_kick_tx = self.path_setup_kick_tx.clone();
+        let relay_probe_kick_rx = relay_probe_kick_tx.subscribe();
+        // The probe loop and handshake maintenance each keep their own watch
+        // cursor. A first business packet therefore wakes both paths without
+        // making either consumer steal the other's notification.
+        let handshake_kick_rx = relay_probe_kick_rx.clone();
+        self.task_manager
+            .spawn(
+                "network-outbound",
+                true,
+                run_network_outbound(
+                    outbound_rx,
+                    self.transport.clone(),
+                    self.peers.clone(),
+                    prefer_direct,
+                    self.udp_transport.clone(),
+                    self.relay_transport.clone(),
+                    relay_available_rx,
+                    relay_startup_wait,
+                    relay_probe_kick_tx,
+                    self.timeline.clone(),
+                ),
+            )
+            .await;
+        self.task_manager
+            .spawn(
+                "direct-first-deadline",
+                false,
+                run_direct_first_deadline_loop(self.peers.clone(), self.shutdown_rx.clone()),
+            )
+            .await;
+        self.task_manager
+            .spawn(
+                "direct-probe",
+                false,
+                run_direct_probe_loop(
+                    self.peers.clone(),
+                    self.udp_transport.clone(),
+                    self.local_candidates.clone(),
+                    self.candidate_snapshot.clone(),
+                    self.punch_attempts.clone(),
+                    self.control.clone(),
+                    self.runtime_stun_servers.clone(),
+                    self.runtime_stun_timeout.clone(),
+                    self.boot_epoch_ms,
+                    DIRECT_RETRY_BASE_INTERVAL,
+                    punch_interval,
+                    punch_attempts.clamp(1, 3),
+                ),
+            )
+            .await;
+        self.task_manager
+            .spawn(
+                "relay-peer-validation",
+                false,
+                run_relay_peer_validation_loop(
+                    self.peers.clone(),
+                    self.transport.clone(),
+                    self.relay_transport.clone(),
+                    virtual_ip.clone(),
+                ),
+            )
+            .await;
+        // Forced-relay path-probe loop: confirms RelayPeerConfirmed with a
+        // matching probe/ACK (real ingress relay) before any business packet
+        // rides the relay.  Kicked event-driven by the outbound actor.
+        let probe_peers = self.peers.clone();
+        let probe_transport = self.transport.clone();
+        let probe_relay_transport = self.relay_transport.clone();
+        let probe_local_vip = virtual_ip.clone();
+        let probe_timeline = self.timeline.clone();
+        let probe_shutdown_rx = self.shutdown_rx.clone();
+        self.task_manager
+            .spawn(
+                "relay-peer-probe",
+                false,
+                run_relay_peer_probe_loop(
+                    probe_peers,
+                    probe_transport,
+                    probe_relay_transport,
+                    probe_local_vip,
+                    probe_timeline,
+                    relay_probe_kick_rx,
+                    probe_shutdown_rx,
+                ),
+            )
+            .await;
+        if self.config.diagnostics.enabled {
+            let diagnostics_bind = self.config.diagnostics.bind.clone();
+            info!("[diagnostics] starting on {diagnostics_bind}");
+            #[cfg(target_os = "android")]
+            let runtime_incarnation = self.android_runtime_incarnation;
+            #[cfg(not(target_os = "android"))]
+            let runtime_incarnation = None;
+            let diagnostics_context = DiagnosticsContext::new(
+                self.config.clone(),
+                self.peers.clone(),
+                self.udp_transport.clone(),
+                self.candidate_snapshot.clone(),
+                self.nat_profile.clone(),
+                self.gateway_mapping_diagnostics.clone(),
+                self.relay_transport.clone(),
+                self.relay_selection.clone(),
+                self.health.clone(),
+                self.task_manager.clone(),
+                self.route_manager.clone(),
+                self.shutdown_tx.clone(),
+                self.timeline.clone(),
+                self.status_events.clone(),
+                self.config.diagnostics.log_path.clone(),
+                self.config.diagnostics.auth_token.clone(),
+                runtime_incarnation,
+            )
+            .with_room_authorization(self.control.room_authorization().await);
+            let shutdown_rx = self.shutdown_rx.clone();
+            let (diagnostics_ready_tx, diagnostics_ready_rx) = tokio::sync::oneshot::channel();
+            self.task_manager
+                .spawn("diagnostics", false, async move {
+                    if let Err(err) = run_diagnostics_server_with_retry_ready(
+                        diagnostics_bind,
+                        diagnostics_context,
+                        shutdown_rx,
+                        Some(diagnostics_ready_tx),
+                    )
+                    .await
+                    {
+                        warn!("Diagnostics endpoint stopped: {err}");
+                    }
+                })
+                .await;
+            let diagnostics_ready =
+                tokio::time::timeout(Duration::from_secs(5), diagnostics_ready_rx).await;
+            if !matches!(diagnostics_ready, Ok(Ok(()))) {
+                error!("[diagnostics] bind failed during startup");
+                self.task_manager.shutdown_all(Duration::from_secs(1)).await;
+                return Err(DaemonError::Network(
+                    "diagnostics bind failed during startup".to_string(),
+                ));
+            }
+
+            if tun.is_some() {
+                let speed_test_virtual_ip = self.config.network.virtual_ip.clone();
+                let speed_test_shutdown_rx = self.shutdown_rx.clone();
+                self.task_manager
+                    .spawn("speed-test", false, async move {
+                        if let Err(err) = run_speedtest_server_with_retry(
+                            speed_test_virtual_ip,
+                            speed_test_shutdown_rx,
+                        )
+                        .await
+                        {
+                            warn!("Speed-test endpoint stopped: {err}");
+                        }
+                    })
+                    .await;
+            }
+        }
+        self.spawn_dataplane_tasks(tun, network_inbound_rx).await;
+
+        let local_candidate_sources = self.local_candidate_sources.clone();
+        let udp_direct_context = UdpDirectTaskContext {
+            udp_bind,
+            fresh_mapping_harness_loopback: self.config.network.fresh_mapping_harness_loopback,
+            peers: self.peers.clone(),
+            control: self.control.clone(),
+            local_candidates: self.local_candidates.clone(),
+            local_candidate_sources: local_candidate_sources.clone(),
+            local_network_identity: self.local_network_identity.clone(),
+            candidate_snapshot: self.candidate_snapshot.clone(),
+            candidate_refresh_lock: self.candidate_refresh_lock.clone(),
+            nat_profile: self.nat_profile.clone(),
+            gateway_mapping_runtime: self.gateway_mapping_runtime.clone(),
+            gateway_mapping_diagnostics: self.gateway_mapping_diagnostics.clone(),
+            udp_transport_publication: self.udp_transport_publication.clone(),
+            direct_validation_transport: self.transport.clone(),
+            direct_validation_local_ip: self.config.network.virtual_ip.clone(),
+            udp_inbound_tx: network_inbound_tx.clone(),
+            local_node_id: self.config.node.node_id.clone(),
+            stun_servers,
+            stun_server_specs: self.config.network.stun_servers.clone(),
+            udp_observer_specs: self.config.network.udp_observers.clone(),
+            runtime_stun_servers: self.runtime_stun_servers.clone(),
+            stun_timeout,
+            udp_advertise,
+            upnp_enabled,
+            socket_pool_enabled,
+            socket_pool_size,
+            keepalive_interval,
+            punch_deduplicator: self.punch_attempts.clone(),
+            udp_punch_interval: punch_interval,
+            udp_punch_attempts: punch_attempts,
+            boot_epoch_ms: self.boot_epoch_ms,
+            proxy_env,
+            excluded_interfaces,
+            shutdown_rx: self.shutdown_rx.clone(),
+            android_network_change_rx: self.android_network_change_direct_rx.clone(),
+            android_network_change_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        self.task_manager
+            .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))
+            .await;
+
+        // Periodic session rekey checker — truly invokes needs_rekey / is_expired.
+        self.task_manager
+            .spawn(
+                "handshake-maintenance",
+                false,
+                run_handshake_maintenance(HandshakeMaintenanceContext {
+                    peers: self.peers.clone(),
+                    transport: self.transport.clone(),
+                    pending: self.pending_handshakes.clone(),
+                    handshake_arbiter: self.handshake_arbiter.clone(),
+                    control: self.control.clone(),
+                    local_candidates: self.local_candidates.clone(),
+                    local_candidate_sources: local_candidate_sources.clone(),
+                    local_network_identity: self.local_network_identity.clone(),
+                    candidate_snapshot: self.candidate_snapshot.clone(),
+                    candidate_refresh_lock: self.candidate_refresh_lock.clone(),
+                    nat_profile: self.nat_profile.clone(),
+                    udp_transport: self.udp_transport.clone(),
+                    runtime_stun_servers: self.runtime_stun_servers.clone(),
+                    runtime_stun_timeout: self.runtime_stun_timeout.clone(),
+                    udp_advertise: self.config.network.udp_advertise.clone(),
+                    node_private_key: self.config.node.private_key.clone(),
+                    kick_rx: handshake_kick_rx,
+                    handshake_retry_kick_tx: self.handshake_retry_kick_tx.clone(),
+                    timeline: self.timeline.clone(),
+                }),
+            )
+            .await;
+
+        info!("[startup] ready");
+
+        // On Android, the JNI thread acknowledges the daemon launch as soon
+        // as the runtime handle is installed so the VpnService can remain
+        // responsive. Report the separate, meaningful readiness transition
+        // only after registration, TUN attachment, diagnostics, and all
+        // initial core task handles have been installed. If any of the
+        // fallible setup above fails, this flag stays false and the native
+        // bridge surfaces the recorded error instead of presenting a
+        // briefly-live VPN that immediately disappears without context.
+        #[cfg(target_os = "android")]
+        if let Some(ready) = self.android_startup_ready.take() {
+            ready.store(true, std::sync::atomic::Ordering::Release);
+            info!("Android daemon startup completed; VPN dataplane is ready");
+        }
+
+        // Signal leasing is gated until this point so an offer/answer cannot
+        // be held by the server while startup is still constructing the
+        // daemon's control-event consumer.  Mark the edge immediately before
+        // entering the consumer loop; any queued roster events are then
+        // drained in order and the first signal is applied without lease HOL.
+        self.control.mark_event_loop_ready();
+        self.run_control_event_loop(&mut relay_started, network_inbound_tx.clone())
+            .await;
+
+        info!("Daemon shutting down");
+        // Release the control-plane presence lease before P2P/TUN teardown.
+        // The request is best effort and bounded; the server TTL covers
+        // crashes, power loss and network failure.
+        let _ = self.control.shutdown().await;
+        // Explicit cleanup: clean routes without relying on Drop.
+        if let Some(udp) = self.udp_transport.read().await.clone() {
+            udp.detach_all_dynamic_punch_sockets("daemon_shutdown")
+                .await;
+        }
+        // Withdraw the live publication before background tasks are aborted so
+        // inbound consumers and the instance-owned peer-reflexive worker see
+        // a deterministic shutdown transition instead of retaining a stale
+        // socket clone through daemon teardown.
+        self.udp_transport_publication.clear_current().await;
+        self.request_shutdown();
+        self.task_manager.shutdown_all(Duration::from_secs(5)).await;
+        self.route_manager.cleanup();
+        Ok(())
+    }
+}

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- The Flutter client talks to the local P2WLAN control/diagnostics endpoint.
+         Local development commonly uses plain HTTP on localhost/LAN. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

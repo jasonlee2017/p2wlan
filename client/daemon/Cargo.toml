@@ -1,0 +1,55 @@
+[package]
+name = "p2wlan-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P2WLAN client daemon"
+
+[lib]
+name = "p2pnet_daemon"
+
+[[bin]]
+name = "p2wlan-daemon"
+path = "src/main.rs"
+
+[dependencies]
+p2pnet-tun = { path = "../tun", version = "0.1.147" }
+p2pnet-crypto = { path = "../crypto", version = "0.1.147" }
+p2pnet-wireguard = { path = "../wireguard", version = "0.1.147" }
+p2pnet-nat = { path = "../nat", version = "0.1.147" }
+p2pnet-netbind = { path = "../netbind", version = "0.1.147" }
+p2pnet-relay = { path = "../relay", version = "0.1.147" }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+libc = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+igd-next = { version = "0.17.1", default-features = false, features = ["aio_tokio"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+fs2 = "0.4"
+blake2 = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }

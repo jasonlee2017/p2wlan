@@ -1,0 +1,640 @@
+impl PeerManager {
+    pub(crate) fn committed_business_path_snapshot_sync(
+        &self,
+        peer_id: &str,
+    ) -> Option<CommittedBusinessPathSnapshot> {
+        self.committed_business_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(peer_id)
+            .cloned()
+    }
+
+    /// Read exact committed business-path projections without touching the
+    /// contended async connection map or its intentionally stale diagnostics
+    /// fallback cache.
+    pub(crate) fn committed_business_path_snapshots_sync(
+        &self,
+    ) -> Vec<CommittedBusinessPathSnapshot> {
+        self.committed_business_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Subscribe to committed path/lifecycle/epoch changes. Tokio watch keeps
+    /// the latest sequence, so a consumer cannot lose a commit that happens
+    /// before its task is scheduled.
+    pub(crate) fn subscribe_committed_business_path_changes(
+        &self,
+    ) -> tokio::sync::watch::Receiver<u64> {
+        self.committed_business_path_change_tx.subscribe()
+    }
+
+    fn cached_diagnostics(&self) -> Vec<PeerDiagnostics> {
+        self.diagnostics_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn cache_diagnostics(&self, peers: &[PeerDiagnostics]) {
+        *self
+            .diagnostics_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(peers.to_vec());
+    }
+
+    /// Record bytes sent to a peer.
+    pub async fn record_sent(&self, node_id: &str, n: u64) {
+        // Traffic counters are advisory diagnostics.  Never enqueue a writer
+        // from the dataplane: Tokio's fair RwLock keeps later try-only relay
+        // confirmation commits contended while this low-value update waits
+        // behind a lifecycle transaction.
+        if let Ok(mut connections) = self.connections.try_write() {
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_sent(n);
+            }
+        }
+    }
+
+    /// Record bytes received from a peer.
+    pub async fn record_received(&self, node_id: &str, n: u64) {
+        // See `record_sent`: a dropped counter sample is preferable to
+        // parking the single dataplane task behind a fair writer queue.
+        if let Ok(mut connections) = self.connections.try_write() {
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_received(n);
+            }
+        }
+    }
+
+    /// Get all active connections.
+    pub async fn active_connections(&self) -> Vec<PeerConnection> {
+        self.connections
+            .read()
+            .await
+            .values()
+            .filter(|c| c.is_active())
+            .cloned()
+            .collect()
+    }
+
+    /// Get all connections (including inactive).
+    pub async fn all_connections(&self) -> Vec<PeerConnection> {
+        self.connections.read().await.values().cloned().collect()
+    }
+
+    /// Snapshot every connection without joining Tokio's writer-preferred
+    /// wait queue.  `/status` uses this so a queued lifecycle writer cannot
+    /// place every later diagnostics reader behind it indefinitely.
+    pub(crate) fn try_all_connections(&self) -> Option<Vec<PeerConnection>> {
+        self.connections
+            .try_read()
+            .ok()
+            .map(|connections| connections.values().cloned().collect())
+    }
+
+    /// Return peers that need an active relay data-plane confirmation.
+    pub async fn relay_validation_targets(
+        &self,
+        max_success_age: Duration,
+    ) -> Vec<(String, String)> {
+        // A relay `peer_not_found` starts a bounded registration-handoff
+        // grace window. The dedicated forced-relay probe loop owns the fast,
+        // per-peer retry during that window. This slower validation loop must
+        // stay quiet so it does not duplicate the retry or consume the shared
+        // relay writer lane; once the grace expires it may re-check the
+        // registration and a second 404 can enter quarantine.
+        let grace_peers = self.relay_not_found_grace_peers().await;
+        let candidates: Vec<_> = self
+            .connections
+            .read()
+            .await
+            .values()
+            .filter(|conn| {
+                // The validation loop is a proactive data-plane check, not a
+                // cleanup mechanism for the historical peer roster. Offline
+                // and closed peers are not registered at the relay; sending
+                // to them every five seconds creates a 404 storm, consumes
+                // the relay writer lane, and can delay the current peer's
+                // probe. They are handled by lifecycle cleanup instead.
+                conn.online
+                    && conn.state != ConnectionState::Closed
+                    && !grace_peers.contains(&conn.node_id)
+                    && (conn.state != ConnectionState::Direct
+                        || conn
+                            .direct_health
+                            .rtt_ewma_ms
+                            .or(conn.direct_health.latency_ms)
+                            .is_some_and(|rtt| rtt >= SLOW_DIRECT_RELAY_VALIDATION_RTT_MS))
+            })
+            .filter(|conn| !conn.relay_health.is_confirmed_recent(max_success_age))
+            .map(|conn| (conn.node_id.clone(), conn.virtual_ip.clone()))
+            .collect();
+        let mut targets = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !self.peer_quarantined(&candidate.0).await {
+                targets.push(candidate);
+            }
+        }
+        targets
+    }
+
+    /// Get serializable diagnostics for every peer.
+    pub async fn diagnostics(&self) -> Vec<PeerDiagnostics> {
+        // Diagnostics is a read-only fast path.  Do not wait behind the
+        // network-generation write lock here: a generation transition may
+        // legitimately hold that lock while it invalidates live paths.  The
+        // atomic mirror is published in the same critical section and is the
+        // value already used by the dataplane-safe diagnostics path below.
+        let generation = self.current_network_generation_sync();
+        let profile_generation = self.current_local_profile_generation_sync();
+        let local_nat_capabilities = self.local_nat_profile.try_read().ok().and_then(|profile| {
+            profile.as_ref().map(|profile| {
+                NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
+            })
+        });
+        let relay_available = self.relay_first_required();
+        let traversal_history = self
+            .traversal_history
+            .try_read()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let fresh_mapping_history = self
+            .fresh_mapping_history
+            .try_lock()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let recovery_reports = self.recovery_epoch_diagnostics();
+        let dplpmtud_reports = self
+            .current_dplpmtud_runtime()
+            .await
+            .map(|runtime| runtime.snapshots())
+            .unwrap_or_default();
+        // `try_read` also fails when a writer is merely queued.  During normal
+        // probe/control activity that made `/peers` intermittently return an
+        // empty roster even though the control poll had already joined the
+        // devices.  Keep the endpoint non-blocking, but return the last
+        // complete snapshot instead of manufacturing a false zero-peer result.
+        let mut peers: Vec<_> = match self.connections.try_read() {
+            Ok(connections) => connections
+                .values()
+                .map(|conn| {
+                    let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
+                        conn,
+                        None,
+                        None,
+                        generation,
+                        None,
+                        local_nat_capabilities.as_ref(),
+                        relay_available,
+                        Some(&traversal_history),
+                        Some(&fresh_mapping_history),
+                    );
+                    diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
+                    diagnostics
+                })
+                .collect(),
+            Err(_) => self.cached_diagnostics(),
+        };
+        for peer in &mut peers {
+            peer.dplpmtud = dplpmtud_reports.get(&peer.node_id).cloned();
+            peer.path_observability
+                .apply_dplpmtud_runtime(peer.dplpmtud.as_ref());
+        }
+        peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        self.cache_diagnostics(&peers);
+        peers
+    }
+
+    /// Get diagnostics with the live path-selector decision for every peer.
+    ///
+    /// This does not update `last_path_selection`; it is a read-only snapshot
+    /// used by CLI/UI diagnostics to explain why data would use Direct or Relay
+    /// right now.
+    pub async fn diagnostics_with_path_selection(
+        &self,
+        prefer_direct: bool,
+        relay_available: bool,
+        direct_retry_after: Duration,
+        local_endpoint: Option<SocketAddr>,
+    ) -> Vec<PeerDiagnostics> {
+        // Use the lock-free generation mirror so a busy handover cannot make
+        // /status or /peers wait until the diagnostics timeout.
+        let generation = self.current_network_generation_sync();
+        let profile_generation = self.current_local_profile_generation_sync();
+        let local_nat_capabilities = self.local_nat_profile.try_read().ok().and_then(|profile| {
+            profile.as_ref().map(|profile| {
+                NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
+            })
+        });
+        let traversal_history = self
+            .traversal_history
+            .try_read()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let fresh_mapping_history = self
+            .fresh_mapping_history
+            .try_lock()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let recovery_reports = self.recovery_epoch_diagnostics();
+        let dplpmtud_reports = self
+            .current_dplpmtud_runtime()
+            .await
+            .map(|runtime| runtime.snapshots())
+            .unwrap_or_default();
+        let mut peers: Vec<_> = match self.connections.try_read() {
+            Ok(connections) => connections
+                .values()
+                .map(|conn| {
+                    let policy = self.config.relay.effective_path_policy(prefer_direct);
+                    let current_selection =
+                        conn.select_path_for_data_with_policy(generation, policy, relay_available);
+                    let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
+                        conn,
+                        Some(&current_selection),
+                        Some(direct_retry_after),
+                        generation,
+                        local_endpoint,
+                        local_nat_capabilities.as_ref(),
+                        relay_available,
+                        Some(&traversal_history),
+                        Some(&fresh_mapping_history),
+                    );
+                    diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
+                    diagnostics
+                })
+                .collect(),
+            Err(_) => self.cached_diagnostics(),
+        };
+        for peer in &mut peers {
+            peer.dplpmtud = dplpmtud_reports.get(&peer.node_id).cloned();
+            peer.path_observability
+                .apply_dplpmtud_runtime(peer.dplpmtud.as_ref());
+        }
+        peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        self.cache_diagnostics(&peers);
+        peers
+    }
+
+    /// Return one peer's diagnostics from a single connection-lock snapshot.
+    ///
+    /// The diagnostics HTTP fast path uses this instead of materializing every
+    /// peer in a large control network.  The selector decision is computed
+    /// from one immutable connection snapshot.  Diagnostics must not acquire
+    /// the network epoch gate: that gate is reserved for dataplane state
+    /// transitions, and making a read-only status request wait behind a
+    /// generation cancellation can make the health endpoint report a false
+    /// outage while relay traffic is still progressing.
+    pub async fn diagnostic_with_path_selection(
+        &self,
+        node_id: &str,
+        prefer_direct: bool,
+        relay_available: bool,
+        direct_retry_after: Duration,
+        local_endpoint: Option<SocketAddr>,
+    ) -> Option<(u64, PeerDiagnostics)> {
+        let traversal_history = self
+            .traversal_history
+            .try_read()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let fresh_mapping_history = self
+            .fresh_mapping_history
+            .try_lock()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let recovery = self.recovery_epoch_diagnostics().remove(node_id);
+        let dplpmtud = self
+            .current_dplpmtud_runtime()
+            .await
+            .and_then(|runtime| runtime.snapshots().remove(node_id));
+        let generation = self.current_network_generation_sync();
+        let profile_generation = self.current_local_profile_generation_sync();
+        let local_nat_capabilities = self.local_nat_profile.try_read().ok().and_then(|profile| {
+            profile.as_ref().map(|profile| {
+                NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
+            })
+        });
+        let conns = self.connections.try_read().ok()?;
+        let conn = conns.get(node_id)?;
+        let policy = self.config.relay.effective_path_policy(prefer_direct);
+        let current_selection =
+            conn.select_path_for_data_with_policy(generation, policy, relay_available);
+        let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
+            conn,
+            Some(&current_selection),
+            Some(direct_retry_after),
+            generation,
+            local_endpoint,
+            local_nat_capabilities.as_ref(),
+            relay_available,
+            Some(&traversal_history),
+            Some(&fresh_mapping_history),
+        );
+        diagnostics.dplpmtud = dplpmtud;
+        diagnostics
+            .path_observability
+            .apply_dplpmtud_runtime(diagnostics.dplpmtud.as_ref());
+        diagnostics.recovery = recovery;
+        Some((generation, diagnostics))
+    }
+
+    /// Number of active peers. Offline control records do not count toward
+    /// the isolated two-device acceptance guard.
+    pub async fn active_connection_count(&self) -> usize {
+        self.connections
+            .read()
+            .await
+            .values()
+            .filter(|connection| connection.is_active())
+            .count()
+    }
+
+    /// Serialized recovery-epoch budget reports for every peer with an active
+    /// recovery epoch: the hard per-epoch ceilings (probe credit,
+    /// fresh-mapping generations, HTTP publishes) are surfaced in status.
+    fn recovery_epoch_diagnostics(&self) -> HashMap<String, RecoveryEpochDiagnostics> {
+        let now = Instant::now();
+        let Ok(epochs) = self.recovery_epochs.try_read() else {
+            return HashMap::new();
+        };
+        let mut reports = HashMap::new();
+        for (peer_id, state) in epochs.iter() {
+            reports.insert(
+                peer_id.clone(),
+                RecoveryEpochDiagnostics {
+                    epoch: state.epoch,
+                    stage: state.stage.label().to_string(),
+                    stage_age_ms: duration_millis(
+                        now.saturating_duration_since(state.stage_started_at),
+                    ),
+                    epoch_age_ms: duration_millis(
+                        now.saturating_duration_since(state.epoch_started_at),
+                    ),
+                    probe_credit_remaining: state.epoch_probe_credit_remaining,
+                    fresh_generation_quota_remaining: state.epoch_fresh_generation_quota_remaining,
+                    hard_hard_generation_quota_remaining: state
+                        .epoch_hard_hard_generation_quota_remaining,
+                    http_quota_remaining: state.epoch_http_quota_remaining,
+                    scatter_windows_sent: state.epoch_scatter_windows_sent,
+                    ack_feedback_seen: state.ack_feedback_seen,
+                },
+            );
+        }
+        reports
+    }
+
+    /// Get connection statistics.
+    pub async fn stats(&self) -> PeerManagerStats {
+        let conns = self.connections.read().await;
+        let total = conns.len();
+        let direct = conns
+            .values()
+            .filter(|c| c.state == ConnectionState::Direct)
+            .count();
+        let relay = conns
+            .values()
+            .filter(|c| c.state == ConnectionState::Relay)
+            .count();
+        let total_bytes_sent = conns.values().map(|c| c.bytes_sent).sum();
+        let total_bytes_received = conns.values().map(|c| c.bytes_received).sum();
+
+        PeerManagerStats {
+            total_peers: total,
+            direct_connections: direct,
+            relay_connections: relay,
+            total_bytes_sent,
+            total_bytes_received,
+            path_observability: PathObservabilityMetrics::default(),
+            outbound_drops: HashMap::new(),
+            outbound_send_failures: HashMap::new(),
+            outbound_loss_events: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct DiagnosticLogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticLogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_hard_auxiliary_info_survives_writer_contention_without_sensitive_detail() {
+        let config = Config::generate_default("http://ctrl.test", "default").unwrap();
+        let manager = PeerManager::new(config);
+        let _writer = manager.connections.write().await;
+        let capture = DiagnosticLogCapture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let sink = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || sink.clone())
+            .finish();
+        let stages = [
+            "hard_hard_probe_summary",
+            "hard_hard_birthday_sweep_summary",
+            "hard_hard_sweep_completed",
+            "hard_hard_sweep_failed",
+            "hard_hard_failed",
+            "hard_hard_winner_selected",
+        ];
+        // Poll real recorder futures under a local subscriber. No timeline is
+        // installed, no DEBUG target is enabled, and the ring writer stays held.
+        tracing::subscriber::with_default(subscriber, || {
+            let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            for stage in stages {
+                let mut event = Box::pin(manager.record_direct_event_for_generation_with_socket(
+                    "peer-hard-info",
+                    17,
+                    stage,
+                    Some("198.51.100.123:49200".parse().unwrap()),
+                    Some(7),
+                    Some(11),
+                    Some(13),
+                    "token=secret-probe-token owner_token=secret-owner detail=private-marker local_endpoint=192.0.2.42:41000",
+                ));
+                assert!(
+                    std::future::Future::poll(event.as_mut(), &mut context).is_ready(),
+                    "{stage} must not wait for diagnostics"
+                );
+            }
+            manager.record_direct_event_non_queuing(
+                "peer-hard-info",
+                "direct_punch_started",
+                None,
+                None,
+                None,
+                "ordinary events must not gain INFO volume",
+            );
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        for stage in stages {
+            assert!(output.contains(&format!("event=\"{stage}\"")), "{output}");
+        }
+        assert_eq!(output.lines().count(), stages.len(), "{output}");
+        for field in [
+            "INFO",
+            "network_generation=17",
+            "socket_index=Some(7)",
+            "candidate_count=Some(11)",
+            "sent_probes=Some(13)",
+        ] {
+            assert!(output.contains(field), "missing {field}: {output}");
+        }
+        for forbidden in [
+            "secret-probe-token",
+            "secret-owner",
+            "private-marker",
+            "198.51.100.123",
+            "192.0.2.42",
+            "endpoint=",
+            "detail=",
+            "token=",
+            "direct_punch_started",
+        ] {
+            assert!(!output.contains(forbidden), "leaked {forbidden}: {output}");
+        }
+    }
+
+    #[tokio::test]
+    async fn full_diagnostics_does_not_wait_for_generation_writer() {
+        let config = Config::generate_default("http://ctrl.test", "default").unwrap();
+        let manager = PeerManager::new(config);
+        let _generation_writer = manager.network_generation.write().await;
+        let _connection_writer = manager.connections.write().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.diagnostics_with_path_selection(true, false, DIRECT_RETRY_BASE_INTERVAL, None),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_event_recording_does_not_wait_for_connection_writer() {
+        let config = Config::generate_default("http://ctrl.test", "default").unwrap();
+        let manager = PeerManager::new(config);
+        let _connection_writer = manager.connections.write().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.record_direct_event(
+                "peer-under-lock",
+                "peer_offer_received",
+                None,
+                Some(96),
+                None,
+                "diagnostic lock contention regression",
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn hard_hard_auxiliary_events_never_queue_behind_connection_writer() {
+        let config = Config::generate_default("http://ctrl.test", "default").unwrap();
+        let manager = PeerManager::new(config);
+        manager
+            .add_peer(&crate::control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
+                node_id: "peer-hard-lock".to_string(),
+                device_name: String::new(),
+                app_version: "0.2.0-test".to_string(),
+                public_key: "pk-hard-lock".to_string(),
+                endpoint: "127.0.0.1:41000".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.9".to_string(),
+                online: true,
+                last_seen: 1,
+                relay_rtt_ms: None,
+            })
+            .await;
+
+        let connection_writer = manager.connections.write().await;
+        let stages = [
+            "hard_hard_sweep_started",
+            "hard_hard_direct_validation_started",
+            "hard_hard_probe_summary",
+            "hard_hard_birthday_sweep_summary",
+            "hard_hard_sweep_completed",
+            "hard_hard_sweep_failed",
+            "hard_hard_failed",
+            "hard_hard_winner_selected",
+        ];
+        for stage in stages {
+            let mut event = Box::pin(manager.record_direct_event(
+                "peer-hard-lock",
+                stage,
+                None,
+                Some(1),
+                Some(1),
+                "diagnostic must not block packet or terminal-report handoff",
+            ));
+            assert!(futures_util::poll!(event.as_mut()).is_ready(), "{stage}");
+            let mut socket_event =
+                Box::pin(manager.record_direct_event_for_generation_with_socket(
+                    "peer-hard-lock",
+                    manager.current_network_generation_sync(),
+                    stage,
+                    None,
+                    Some(7),
+                    Some(1),
+                    Some(1),
+                    "generation-stable diagnostic must not queue either",
+                ));
+            assert!(
+                futures_util::poll!(socket_event.as_mut()).is_ready(),
+                "{stage} with exact socket"
+            );
+        }
+        drop(connection_writer);
+        // An uncontended ring still receives these events, including the exact
+        // socket metadata; contention changes diagnostic delivery, not facts.
+        manager
+            .record_direct_event_for_generation_with_socket(
+                "peer-hard-lock",
+                manager.current_network_generation_sync(),
+                "hard_hard_birthday_sweep_summary",
+                None,
+                Some(7),
+                Some(1),
+                Some(1),
+                "uncontended summary",
+            )
+            .await;
+        let connection = manager
+            .get_connection("peer-hard-lock")
+            .await
+            .expect("test peer must remain in the manager");
+        assert!(connection
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "hard_hard_birthday_sweep_summary"));
+    }
+}

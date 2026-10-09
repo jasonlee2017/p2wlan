@@ -1,0 +1,559 @@
+fn main() -> p2pnet_daemon::Result<()> {
+    // This strict repair entry never reads tokens/configuration or starts the
+    // daemon. It must remain ahead of every ordinary startup side effect.
+    if run_runtime_directory_prepare_from_process_args()? {
+        return Ok(());
+    }
+    // The lifecycle probes are intentionally parsed before Clap and before any
+    // token/config/logging/instance-lock side effect. They are strict, hidden
+    // packaging contracts rather than production daemon options.
+    if run_lifecycle_probe_from_process_args()? {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // A GUI-subsystem process normally has no console, but a console
+        // launched from a terminal (and the dedicated CI Ctrl+C harness) can
+        // attach one explicitly before registering the native handler.
+        let _ = attach_windows_parent_console_for_test();
+        if windows_service_requested() {
+            return run_windows_service();
+        }
+        let signal = install_windows_console_handler()?;
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| DaemonError::TaskCrash(error.to_string()))?
+            .block_on(run_daemon(signal))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| DaemonError::TaskCrash(error.to_string()))?
+        .block_on(run_daemon())
+}
+
+const WINDOWS_SHUTDOWN_DEADLINE_MS: u64 = 10_000;
+
+#[cfg(target_os = "windows")]
+async fn run_daemon(
+    windows_signal: std::sync::Arc<WindowsLifecycleSignal>,
+) -> p2pnet_daemon::Result<()> {
+    run_daemon_inner(Some(windows_signal)).await
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn run_daemon() -> p2pnet_daemon::Result<()> {
+    run_daemon_inner().await
+}
+
+#[cfg(target_os = "windows")]
+async fn wait_for_windows_lifecycle_signal(
+    signal: std::sync::Arc<WindowsLifecycleSignal>,
+) -> &'static str {
+    loop {
+        let reason = signal.reason();
+        if reason != 0 {
+            return windows_lifecycle_reason(reason);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+async fn run_daemon_inner(
+    #[cfg(target_os = "windows")] windows_signal: Option<std::sync::Arc<WindowsLifecycleSignal>>,
+) -> p2pnet_daemon::Result<()> {
+    // Parse arguments BEFORE any side effects (including logging setup)
+    // This guarantees --help and --version exit cleanly without side effects.
+    let cli = Cli::parse();
+
+    if let Err(error) = validate_cli(&cli) {
+        let error = DaemonError::Config(format!("STARTUP_CONFIG_INVALID: {error}"));
+        append_early_startup_error(cli.log_file.as_ref(), &error);
+        return Err(error);
+    }
+
+    // Resolve this before any generated config is saved.  The token file keeps
+    // credentials out of `ps`, shell history, and the audited daemon command
+    // line. It is the only supported way to supply a control-plane token (the
+    // old `--token` flag was removed).
+    let token_file_value = if let Some(path) = cli.token_file.as_ref() {
+        match read_launch_token_file(path) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                // Token-file parsing happens before tracing is initialized.
+                // Persist the failure to the requested log so a hidden UAC
+                // launch remains diagnosable instead of looking like a
+                // generic permission timeout in the GUI.
+                append_early_startup_error(cli.log_file.as_ref(), &error);
+                return Err(error);
+            }
+        }
+    } else if cli.token_stdin {
+        Some(read_launch_token_stdin()?)
+    } else {
+        None
+    };
+
+    // --build-info must print PURE JSON on stdout before any logging is
+    // initialized, so build scripts and CI can parse it verbatim.
+    if cli.build_info {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(p2pnet_daemon::build_info::current()).map_err(|e| {
+                DaemonError::Config(format!("failed to serialize build info: {e}"))
+            })?
+        );
+        return Ok(());
+    }
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _logging_guard = if let Some(ref log_file) = cli.log_file {
+        let (writer, guard) = p2pnet_daemon::diagnostics::logging::bounded_file_writer(log_file)
+            .map_err(|error| {
+                DaemonError::Config(format!(
+                    "failed to initialize bounded private log {}: {error}",
+                    log_file.display()
+                ))
+            })?;
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_timer(p2pnet_daemon::diagnostics::logging::LocalTimer)
+            .with_ansi(false)
+            .with_writer(writer)
+            .init();
+        Some(guard)
+    } else {
+        use std::io::IsTerminal;
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_timer(p2pnet_daemon::diagnostics::logging::LocalTimer)
+            .with_ansi(std::io::stdout().is_terminal())
+            .init();
+        None
+    };
+
+    info!("P2WLAN daemon starting...");
+    info!("Platform: {}", std::env::consts::OS);
+
+    #[cfg(target_os = "windows")]
+    {
+        let windows_elevated = match windows_elevated_token() {
+            Ok(elevated) => elevated,
+            Err(error) => {
+                let daemon_error = DaemonError::Network(format!(
+                    "TOKEN_ACCESS_FAILED: could not inspect the daemon access token: {error}"
+                ));
+                error!("[startup] {daemon_error}");
+                return Err(daemon_error);
+            }
+        };
+        info!("[startup] elevated token verified: windows_elevated={windows_elevated}");
+        if !windows_elevated && std::env::var("P2WLAN_DISABLE_TUN").as_deref() != Ok("1") {
+            let error = DaemonError::Network(
+                "DAEMON_NOT_ELEVATED: Windows TUN requires an elevated administrator token, but p2wlan-daemon is running without elevation.".to_string(),
+            );
+            error!("[startup] {error}");
+            return Err(error);
+        }
+    }
+
+    if token_file_value.is_some() {
+        info!("[startup] launch credential loaded");
+    }
+
+    // Check for --init flag (generate new config)
+    if cli.init {
+        let mut config = Config::generate_default(cli.control_url(), cli.network_id())?;
+        validate_room_profile_overrides(&config, &cli)?;
+        apply_cli_overrides(&mut config, &cli);
+        if let Some(ref token) = token_file_value {
+            config.control.auth_token = token.clone();
+        }
+        let config_path = &cli.config;
+        config.config_path = Some(config_path.clone());
+        let mut persisted = config.clone();
+        if token_file_value.is_some() {
+            // A one-time launch credential is process input, never daemon
+            // configuration. Persist an empty field and keep the real value
+            // only in the in-memory runtime config.
+            persisted.control.auth_token.clear();
+        }
+        persisted.save_to_file(config_path)?;
+        info!("Config saved to {}", config_path.display());
+        info!("Node ID: {}", config.node.node_id);
+        return Ok(());
+    }
+
+    // Load config
+    let config_path = &cli.config;
+
+    let config = if config_path.exists() {
+        match Config::load_from_file(config_path) {
+            Ok(mut c) => {
+                info!("Loaded config from {}", config_path.display());
+                c.config_path = Some(config_path.clone());
+                c
+            }
+            Err(e) => {
+                error!("Failed to load config: {}", e);
+                info!("Use --init to generate a new config");
+                return Err(e);
+            }
+        }
+    } else if cli.status {
+        Config::generate_default("http://127.0.0.1", "default")?
+    } else {
+        info!("No config file found. Generating default config...");
+        let mut config = Config::generate_default(cli.control_url(), cli.network_id())?;
+        validate_room_profile_overrides(&config, &cli)?;
+        apply_cli_overrides(&mut config, &cli);
+        if let Some(ref token) = token_file_value {
+            config.control.auth_token = token.clone();
+        }
+        config.config_path = Some(config_path.clone());
+        let mut persisted = config.clone();
+        if token_file_value.is_some() {
+            persisted.control.auth_token.clear();
+        }
+        persisted.save_to_file(config_path)?;
+        info!("Saved default config to {}", config_path.display());
+        config
+    };
+
+    let mut config = config;
+    validate_room_profile_overrides(&config, &cli)?;
+    apply_cli_overrides(&mut config, &cli);
+    if let Some(ref token) = token_file_value {
+        config.control.auth_token = token.clone();
+    }
+    // Expose the operator-configured log file to the diagnostics server so
+    // `GET /logs/tail` can read it with a bounded tail. In-process only; never
+    // persisted to the config file.
+    config.diagnostics.log_path = cli.log_file.clone();
+
+    if cli.status {
+        print_status(&config, &cli, config_path).await?;
+        return Ok(());
+    }
+
+    // Keep one owner for the TUN, control session, and UDP socket set associated
+    // with this device identity. A duplicate daemon can consume the other
+    // process's offer/answer signals and invalidate authenticated probe MACs.
+    let instance_lock = DaemonInstanceLock::acquire(config_path)?;
+    info!(
+        "Acquired daemon instance lock at {}",
+        instance_lock.path.display()
+    );
+
+    // The instance lock must be held before a diagnostics session file is
+    // refreshed. A second daemon therefore cannot overwrite or remove the
+    // first daemon's active session secret.
+    let _diagnostics_auth = DiagnosticsAuthGuard::prepare(
+        &mut config,
+        config_path,
+        cli.diagnostics_client_sid.as_deref(),
+    )?;
+
+    info!("Node ID: {}", config.node.node_id);
+    info!("Network: {}", config.network.network_id);
+
+    // Create and run the daemon with a shared shutdown signal.
+    let mut daemon = Daemon::new(config);
+    let shutdown_tx = daemon.shutdown_sender();
+
+    // Graceful shutdown: wait for SIGINT/SIGTERM or daemon exit.
+    // Pin the join future so we can select without moving the handle twice.
+    let mut daemon_handle = tokio::spawn(async move { daemon.run().await });
+
+    let shutdown_reason = {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+            tokio::select! {
+                result = &mut daemon_handle => {
+                    match result {
+                        Ok(Ok(())) => {
+                            info!("Daemon exited cleanly");
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            error!("Daemon exited with error: {e}");
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            error!("Daemon task failed: {e}");
+                            return Err(DaemonError::TaskCrash(e.to_string()));
+                        }
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received SIGINT, shutting down...");
+                    Some("SIGINT")
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, shutting down...");
+                    Some("SIGTERM")
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let windows_signal = windows_signal
+                .clone()
+                .expect("Windows lifecycle signal must be installed before daemon startup");
+            tokio::select! {
+                result = &mut daemon_handle => {
+                    match result {
+                        Ok(Ok(())) => {
+                            info!("Daemon exited cleanly");
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            error!("Daemon exited with error: {e}");
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            error!("Daemon task failed: {e}");
+                            return Err(DaemonError::TaskCrash(e.to_string()));
+                        }
+                    }
+                }
+                reason = wait_for_windows_lifecycle_signal(windows_signal) => {
+                    info!("Received Windows lifecycle event {reason}, shutting down...");
+                    Some(reason)
+                }
+            }
+        }
+        #[cfg(all(not(unix), not(target_os = "windows")))]
+        {
+            tokio::select! {
+                result = &mut daemon_handle => {
+                    match result {
+                        Ok(Ok(())) => {
+                            info!("Daemon exited cleanly");
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            error!("Daemon exited with error: {e}");
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            error!("Daemon task failed: {e}");
+                            return Err(DaemonError::TaskCrash(e.to_string()));
+                        }
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received SIGINT, shutting down...");
+                    Some("SIGINT")
+                }
+            }
+        }
+    };
+
+    if let Some(reason) = shutdown_reason {
+        let _ = shutdown_tx.send(true);
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(WINDOWS_SHUTDOWN_DEADLINE_MS),
+            daemon_handle,
+        )
+        .await
+        {
+            Ok(Ok(Ok(()))) => info!("Daemon exited cleanly after {reason}"),
+            Ok(Ok(Err(e))) => {
+                error!("Daemon exited with error after {reason}: {e}");
+                return Err(e);
+            }
+            Ok(Err(e)) => {
+                error!("Daemon task failed after {reason}: {e}");
+                return Err(DaemonError::TaskCrash(e.to_string()));
+            }
+            Err(_) => {
+                error!("Timed out waiting for daemon to stop after {reason}");
+                return Err(DaemonError::TaskCrash(format!(
+                    "graceful shutdown timed out after {reason}"
+                )));
+            }
+        }
+    }
+
+    info!("Shutdown complete.");
+    Ok(())
+}
+
+async fn print_status(
+    config: &Config,
+    cli: &Cli,
+    config_path: &std::path::Path,
+) -> p2pnet_daemon::Result<()> {
+    let url = cli
+        .diagnostics_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}/status", config.diagnostics.bind));
+
+    let auth_dir = cli
+        .log_file
+        .as_ref()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .or_else(|| config_path.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let auth_path = auth_dir.join("p2wlan-daemon.diag-auth");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|error| {
+            DaemonError::Network(format!("failed to create diagnostics client: {error}"))
+        })?;
+
+    let body = 'request: {
+        for attempt in 0..2 {
+            let token = std::fs::read_to_string(&auth_path).map_err(|_| {
+                DaemonError::Network(
+                    "diagnostics session token file is missing; daemon session may have changed"
+                        .to_string(),
+                )
+            })?;
+            let token = token.trim();
+            if token.is_empty() {
+                return Err(DaemonError::Network(
+                    "diagnostics session token file is empty; daemon session may have changed"
+                        .to_string(),
+                ));
+            }
+            let response = client
+                .get(&url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .map_err(|error| {
+                    DaemonError::Network(format!("failed to query diagnostics at {url}: {error}"))
+                })?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                continue;
+            }
+            let status = response.status();
+            let body = response.text().await.map_err(|error| {
+                DaemonError::Network(format!(
+                    "failed to read diagnostics response from {url}: {error}"
+                ))
+            })?;
+            if !status.is_success() {
+                return Err(DaemonError::Network(format!(
+                    "diagnostics endpoint {url} returned HTTP {status}: {body}"
+                )));
+            }
+            break 'request body;
+        }
+        return Err(DaemonError::Network(
+            "diagnostics session changed; daemon returned HTTP 401 twice".to_string(),
+        ));
+    };
+
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+        Err(_) => println!("{body}"),
+    }
+    Ok(())
+}
+
+const MAX_LAUNCH_TOKEN_BYTES: usize = 16 * 1024;
+
+fn append_early_startup_error(log_path: Option<&PathBuf>, error: &dyn std::fmt::Display) {
+    let Some(path) = log_path else { return };
+    // Use the normal bounded private writer so early failures cannot follow
+    // links, grow an unbounded file, or bypass the regular log permissions.
+    let Ok((sink, _guard)) = p2pnet_daemon::diagnostics::logging::bounded_file_writer(path) else {
+        return;
+    };
+    let mut writer = tracing_subscriber::fmt::MakeWriter::make_writer(&sink);
+    let _ = std::io::Write::write_fmt(
+        &mut writer,
+        format_args!("ERROR p2wlan-daemon startup before logging: {error}\n"),
+    );
+}
+
+fn read_launch_token_file(path: &std::path::Path) -> p2pnet_daemon::Result<String> {
+    let result = (|| -> std::io::Result<String> {
+        // The Flutter launcher has already applied the one-shot ACL. Do not
+        // rewrite it from the elevated daemon: when UAC is completed with a
+        // different administrator identity, that account may not match the
+        // interactive user's USERNAME and the pre-logging ACL repair would
+        // make an otherwise valid launch fail with a misleading permission
+        // error. The token is still deleted below after this read.
+        let metadata = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "launch token file is not owner-only",
+                ));
+            }
+        }
+        if metadata.len() > MAX_LAUNCH_TOKEN_BYTES as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launch token file is too large",
+            ));
+        }
+        let value = std::fs::read_to_string(path)?;
+        let token = value.trim();
+        if token.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "launch token file is empty",
+            ));
+        }
+        Ok(token.to_string())
+    })();
+    let remove_result = std::fs::remove_file(path);
+    if let Err(error) = remove_result {
+        return Err(DaemonError::Config(format!(
+            "failed to remove one-time launch token file {}: {error}",
+            path.display()
+        )));
+    }
+    result.map_err(|error| {
+        DaemonError::Config(format!(
+            "failed to read one-time launch token file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn read_launch_token_stdin() -> p2pnet_daemon::Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(MAX_LAUNCH_TOKEN_BYTES + 1);
+    let read_result = std::io::stdin()
+        .take((MAX_LAUNCH_TOKEN_BYTES + 1) as u64)
+        .read_to_end(&mut bytes);
+    let result = read_result
+        .map_err(|error| DaemonError::Config(format!("failed to read token from stdin: {error}")))
+        .and_then(|size| {
+            if size > MAX_LAUNCH_TOKEN_BYTES {
+                return Err(DaemonError::Config(
+                    "stdin launch token exceeds the 16 KiB limit".to_string(),
+                ));
+            }
+            let value = String::from_utf8(std::mem::take(&mut bytes)).map_err(|_| {
+                DaemonError::Config("stdin launch token is not valid UTF-8".to_string())
+            })?;
+            let token = value.trim();
+            if token.is_empty() {
+                return Err(DaemonError::Config(
+                    "stdin launch token is empty".to_string(),
+                ));
+            }
+            Ok(token.to_string())
+        });
+    bytes.fill(0);
+    result
+}

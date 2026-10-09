@@ -1,0 +1,410 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/core/security/local_config_secret.dart';
+import 'package:p2wlan_flutter_client/core/security/redactor.dart';
+import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
+import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
+
+void main() {
+  group('LocalConfigSecret', () {
+    test('round-trips without writing the plaintext to disk', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_admin_secret_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final keyFile = File('${tmp.path}/settings.json.key');
+
+      final encoded = await LocalConfigSecret.encrypt(
+        'admin-password-42',
+        keyFile: keyFile,
+      );
+
+      expect(encoded, startsWith('p2wlan-config-v1:'));
+      expect(encoded, isNot(contains('admin-password-42')));
+      expect(
+        await LocalConfigSecret.decrypt(encoded, keyFile: keyFile),
+        'admin-password-42',
+      );
+    });
+
+    test('rejects a modified local ciphertext', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_admin_secret_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final keyFile = File('${tmp.path}/settings.json.key');
+      final encoded = await LocalConfigSecret.encrypt(
+        'admin-password-42',
+        keyFile: keyFile,
+      );
+      final changed = '${encoded}x';
+
+      expect(
+        () => LocalConfigSecret.decrypt(changed, keyFile: keyFile),
+        throwsA(isA<FormatException>()),
+      );
+    });
+  });
+
+  group('LocalTokenRepository', () {
+    test('round-trips and clears a local token file', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_local_token_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final file = File('${tmp.path}/nested/p2wlan-auth-token');
+      final repo = LocalTokenRepository(file: file);
+
+      expect(await repo.read(), isNull);
+      await repo.write(' local-token ');
+      expect(await repo.read(), 'local-token');
+      expect(await file.readAsString(), 'local-token');
+
+      await repo.clear();
+      expect(await repo.read(), isNull);
+    });
+  });
+
+  group('InMemorySecureTokenRepository', () {
+    test('round-trips and clears', () async {
+      final repo = InMemorySecureTokenRepository();
+      expect(await repo.read(), isNull);
+      await repo.write('tok');
+      expect(await repo.read(), 'tok');
+      await repo.clear();
+      expect(await repo.read(), isNull);
+    });
+  });
+
+  test('secure-store migration supports every legacy token spelling', () async {
+    for (final key in const ['authToken', 'auth_token', 'token']) {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_migrate_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final settingsFile = File('${tmp.path}/settings.json');
+      await settingsFile.writeAsString('{"$key":"legacy-$key"}');
+      final secure = InMemorySecureTokenRepository();
+      final store = SettingsStore(
+        settingsFile: settingsFile,
+        tokenRepository: secure,
+      );
+
+      await store.load();
+
+      expect(await secure.read(), 'legacy-$key');
+      expect(store.settings.authToken, 'legacy-$key');
+      final persisted = await settingsFile.readAsString();
+      expect(persisted.contains('legacy-$key'), isFalse);
+    }
+  });
+
+  test(
+    'local token file write failure preserves the legacy settings value',
+    () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_migrate_fail_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final settingsFile = File('${tmp.path}/settings.json');
+      await settingsFile.writeAsString('{"authToken":"legacy-token"}');
+      final store = SettingsStore(
+        settingsFile: settingsFile,
+        tokenRepository: _FailingSecureTokenRepository(),
+      );
+
+      await store.load();
+
+      expect(await settingsFile.readAsString(), contains('legacy-token'));
+      expect(store.lastError, contains('local token file'));
+    },
+  );
+
+  test(
+    'an existing secure token wins and repeated migration is harmless',
+    () async {
+      final tmp = await Directory.systemTemp.createTemp(
+        'p2wlan_migrate_repeat_',
+      );
+      addTearDown(() async => tmp.delete(recursive: true));
+      final settingsFile = File('${tmp.path}/settings.json');
+      await settingsFile.writeAsString('{"authToken":"legacy-token"}');
+      final secure = InMemorySecureTokenRepository();
+      await secure.write('secure-token');
+      final store = SettingsStore(
+        settingsFile: settingsFile,
+        tokenRepository: secure,
+      );
+
+      await store.load();
+
+      expect(await secure.read(), 'secure-token');
+      expect(store.settings.authToken, 'secure-token');
+      expect(
+        await settingsFile.readAsString(),
+        isNot(contains('legacy-token')),
+      );
+    },
+  );
+
+  group('SettingsStore token handling', () {
+    test(
+      'persists the macOS administrator password only as ciphertext',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp(
+          'p2wlan_admin_settings_',
+        );
+        addTearDown(() async => tmp.delete(recursive: true));
+        final settingsFile = File('${tmp.path}/settings.json');
+        final tokenRepository = InMemorySecureTokenRepository();
+        final store = SettingsStore(
+          settingsFile: settingsFile,
+          tokenRepository: tokenRepository,
+        );
+        await store.load();
+        await store.updateMacosAdminPassword('admin-password-42');
+
+        final raw = await settingsFile.readAsString();
+        expect(raw, isNot(contains('admin-password-42')));
+        expect(
+          (jsonDecode(raw)
+              as Map<String, dynamic>)['macosAdminPasswordCiphertext'],
+          startsWith('p2wlan-config-v1:'),
+        );
+        expect(await File('${settingsFile.path}.key').exists(), isTrue);
+
+        final restored = SettingsStore(
+          settingsFile: settingsFile,
+          tokenRepository: tokenRepository,
+        );
+        await restored.load();
+        expect(restored.settings.macosAdminPassword, 'admin-password-42');
+      },
+    );
+
+    test('onboarding completion rolls back when persistence fails', () async {
+      final tmp = await Directory.systemTemp.createTemp(
+        'p2wlan_onboarding_rollback_',
+      );
+      addTearDown(() async => tmp.delete(recursive: true));
+      final store = SettingsStore(
+        settingsFile: File('${tmp.path}/settings.json'),
+        tokenRepository: _FailingSecureTokenRepository(),
+      );
+      await store.load();
+
+      await expectLater(
+        store.markOnboardingCompleted(),
+        throwsA(isA<Exception>()),
+      );
+      expect(store.settings.onboardingCompleted, isFalse);
+    });
+
+    test('token is never persisted to the settings JSON; local token file holds it', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_ss_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final settingsFile = File('${tmp.path}/settings.json');
+      final secure = InMemorySecureTokenRepository();
+      final store = SettingsStore(
+        settingsFile: settingsFile,
+        tokenRepository: secure,
+      );
+      await store.load();
+      await store.updateSettings(
+        store.settings.copyWith(authToken: 'managed-token'),
+      );
+      final raw = await settingsFile.readAsString();
+      expect(
+        raw.contains('managed-token'),
+        isFalse,
+        reason: 'auth token must not be written to settings JSON',
+      );
+      final persisted = (jsonDecode(raw) as Map<String, dynamic>)['authToken'];
+      expect(persisted, '', reason: 'token field is blanked in persisted JSON');
+      expect(await secure.read(), 'managed-token');
+      expect(store.settings.authToken, 'managed-token');
+    });
+
+    test(
+      'legacy in-JSON token migrates to the local token file on load',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('p2wlan_ss_');
+        addTearDown(() async => tmp.delete(recursive: true));
+        final settingsFile = File('${tmp.path}/settings.json');
+        await settingsFile.writeAsString(
+          '{"authToken":"legacy-token","manualMode":false}',
+        );
+        final secure = InMemorySecureTokenRepository();
+        final store = SettingsStore(
+          settingsFile: settingsFile,
+          tokenRepository: secure,
+        );
+        await store.load();
+        expect(await secure.read(), 'legacy-token');
+        expect(store.settings.authToken, 'legacy-token');
+        await store.updateSettings(store.settings.copyWith(networkId: 'net1'));
+        final raw = await settingsFile.readAsString();
+        expect(raw.contains('legacy-token'), isFalse);
+      },
+    );
+
+    test('logout (blank token) clears the local token file', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_ss_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final settingsFile = File('${tmp.path}/settings.json');
+      final secure = InMemorySecureTokenRepository();
+      final store = SettingsStore(
+        settingsFile: settingsFile,
+        tokenRepository: secure,
+      );
+      await store.load();
+      await store.updateSettings(store.settings.copyWith(authToken: 'tok'));
+      expect(await secure.read(), 'tok');
+      await store.updateSettings(store.settings.copyWith(authToken: ''));
+      expect(await secure.read(), isNull);
+    });
+
+    test('saving manual mode clears a previously managed credential', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_manual_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final secure = InMemorySecureTokenRepository();
+      final store = SettingsStore(
+        settingsFile: File('${tmp.path}/settings.json'),
+        tokenRepository: secure,
+      );
+      await store.load();
+      await store.updateSettings(
+        store.settings.copyWith(authToken: 'managed-token'),
+      );
+
+      await store.updateSettings(store.settings.copyWith(manualMode: true));
+
+      expect(store.settings.manualMode, isTrue);
+      expect(store.settings.authToken, isEmpty);
+      expect(await secure.read(), isNull);
+    });
+
+    test(
+      'load repairs an offline flag left beside a secure credential',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp(
+          'p2wlan_manual_migrate_',
+        );
+        addTearDown(() async => tmp.delete(recursive: true));
+        final settingsFile = File('${tmp.path}/settings.json');
+        await settingsFile.writeAsString('{"manualMode":true,"authToken":""}');
+        final secure = InMemorySecureTokenRepository();
+        await secure.write('managed-token');
+        final store = SettingsStore(
+          settingsFile: settingsFile,
+          tokenRepository: secure,
+        );
+
+        await store.load();
+
+        expect(store.settings.manualMode, isFalse);
+        expect(store.settings.authToken, 'managed-token');
+        final raw = await settingsFile.readAsString();
+        final persisted = jsonDecode(raw) as Map<String, dynamic>;
+        expect(persisted['manualMode'], isFalse);
+        expect(persisted['authToken'], isEmpty);
+      },
+    );
+
+    test(
+      'entering a token after offline mode switches to managed mode',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp(
+          'p2wlan_manual_login_',
+        );
+        addTearDown(() async => tmp.delete(recursive: true));
+        final secure = InMemorySecureTokenRepository();
+        final store = SettingsStore(
+          settingsFile: File('${tmp.path}/settings.json'),
+          tokenRepository: secure,
+        );
+        await store.load();
+        await store.updateSettings(store.settings.copyWith(manualMode: true));
+        final current = store.settings;
+
+        await store.updateConnectionSettings(
+          diagnosticsUrl: current.diagnosticsUrl,
+          controlServer: 'https://control.example',
+          authToken: 'managed-token',
+          networkId: current.networkId,
+          virtualIp: current.virtualIp,
+          deviceName: current.deviceName,
+          manualMode: true,
+          overlayCidr: current.overlayCidr,
+          tunInterface: current.tunInterface,
+          mtu: current.mtu,
+          udpBind: current.udpBind,
+          udpAdvertise: current.udpAdvertise,
+          socketPool: current.socketPool,
+          relayServers: current.relayServers,
+          closeBehavior: current.closeBehavior,
+        );
+
+        expect(store.settings.manualMode, isFalse);
+        expect(store.settings.authToken, 'managed-token');
+        expect(await secure.read(), 'managed-token');
+      },
+    );
+  });
+
+  group('redactSensitive', () {
+    test('masks bearer authorization headers', () {
+      expect(
+        redactSensitive('Authorization: Bearer abc.def-123'),
+        'Authorization: Bearer <redacted>',
+      );
+    });
+
+    test('masks complete non-Bearer authorization values', () {
+      final out = redactSensitive('Authorization: Basic user:password');
+      expect(out, 'Authorization: <redacted>');
+      expect(out, isNot(contains('user:password')));
+    });
+
+    test('masks json token fields (double-quoted)', () {
+      expect(
+        redactSensitive(r'{"token":"secret123"}'),
+        r'{"token":"<redacted>"}',
+      );
+    });
+
+    test('masks key=value and relay ticket forms', () {
+      expect(
+        redactSensitive('token=abc relay_ticket=ticket999'),
+        'token=<redacted> relay_ticket=<redacted>',
+      );
+    });
+
+    test('masks PEM private key bodies', () {
+      const input =
+          '-----BEGIN PRIVATE KEY-----\nMIIEv...\n-----END PRIVATE KEY-----';
+      final out = redactSensitive(input);
+      expect(out.contains('MIIEv'), isFalse);
+      expect(out.contains('<redacted>'), isTrue);
+    });
+
+    test('leaves non-credential text untouched', () {
+      expect(
+        redactSensitive('route installed on p2wlan0'),
+        'route installed on p2wlan0',
+      );
+    });
+
+    test('does not redact the word token in prose without an assignment', () {
+      expect(
+        redactSensitive('token rotation scheduled'),
+        'token rotation scheduled',
+      );
+    });
+  });
+}
+
+class _FailingSecureTokenRepository implements SecureTokenRepository {
+  @override
+  Future<String?> read() async => null;
+
+  @override
+  Future<void> write(String token) async {
+    throw const SecureTokenStorageException('local token file write failed');
+  }
+
+  @override
+  Future<void> clear() async {}
+}

@@ -1,0 +1,320 @@
+name: Build and stage server
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_staging:
+        description: Upload the verified server bundle to the isolated staging host
+        required: true
+        default: false
+        type: boolean
+      ref:
+        description: Source ref to build (tag or commit; defaults to the checked-out ref)
+        required: false
+        type: string
+      deployment_mode:
+        description: Staging action after a successful build
+        required: true
+        default: smoke-upload
+        type: choice
+        options:
+          - smoke-upload
+          - install-upload
+  push:
+    tags:
+      - 'server-v*'
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION_FILE: server/go.mod
+
+jobs:
+  build:
+    name: Build server (${{ matrix.arch }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+          - arch: arm64
+            goarch: arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "22.16.0"
+          cache: npm
+          cache-dependency-path: server/admin-ui/package-lock.json
+
+      - name: Build embedded admin UI
+        working-directory: server/admin-ui
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run build
+          test -s ../admin/web/index.html
+          test -s ../admin/web/app.js
+          test -s ../admin/web/app.css
+          grep -q '/admin/app.js' ../admin/web/index.html
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: Test server
+        working-directory: server
+        run: go test ./...
+
+      - name: Build and checksum server bundle
+        id: bundle
+        working-directory: server
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/server-v') && github.ref_name || format('server-dev-{0}', github.sha) }}
+        run: |
+          set -euo pipefail
+          SOURCE_SHA=$(git rev-parse HEAD)
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == server-dev-* ]]; then VERSION="server-dev-$SOURCE_SHA"; fi
+          rm -rf dist
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath \
+            -ldflags="-s -w -X main.buildVersion=$VERSION -X main.buildCommit=$SOURCE_SHA" \
+            -o dist/p2wlan-control .
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath \
+            -ldflags="-s -w -X main.buildVersion=$VERSION -X main.buildCommit=$SOURCE_SHA" \
+            -o dist/p2wlan-relay ./relay
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -o dist/p2wlan-config ./cmd/p2wlan-config
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -o dist/p2wlan-db ./cmd/p2wlan-db
+          chmod 0755 dist/p2wlan-control dist/p2wlan-relay dist/p2wlan-config dist/p2wlan-db
+          {
+            echo "version=$VERSION"
+            echo "commit=$SOURCE_SHA"
+            echo "arch=$GOARCH"
+            go version
+            go version -m dist/p2wlan-control
+            go version -m dist/p2wlan-relay
+          } > dist/BUILD-METADATA.txt
+          (
+            cd dist
+            sha256sum p2wlan-control p2wlan-relay p2wlan-config p2wlan-db > SHA256SUMS
+          )
+          install -m 0755 ../scripts/p2wlan-server ../scripts/install-server.sh ../scripts/deploy-server.sh dist/
+          tar -C dist -czf "p2wlan-server-linux-${{ matrix.arch }}.tar.gz" \
+            p2wlan-control p2wlan-relay p2wlan-config p2wlan-db p2wlan-server install-server.sh deploy-server.sh BUILD-METADATA.txt SHA256SUMS
+          sha256sum "p2wlan-server-linux-${{ matrix.arch }}.tar.gz" > \
+            "p2wlan-server-linux-${{ matrix.arch }}.tar.gz.sha256"
+
+      - name: Upload server bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-server-linux-${{ matrix.arch }}-${{ steps.bundle.outputs.source_sha }}
+          path: |
+            server/p2wlan-server-linux-${{ matrix.arch }}.tar.gz
+            server/p2wlan-server-linux-${{ matrix.arch }}.tar.gz.sha256
+          retention-days: 14
+
+  stage:
+    name: Deploy verified bundle to staging
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_staging }}
+    runs-on: ubuntu-22.04
+    environment: staging
+    concurrency:
+      group: p2wlan-server-staging
+      cancel-in-progress: false
+    steps:
+      - name: Resolve exact source SHA
+        id: source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Record staging source
+        id: source-sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download built bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: p2wlan-server-linux-*-${{ steps.source-sha.outputs.sha }}
+          path: bundles
+          merge-multiple: true
+
+      - name: Verify bundles match exact source
+        env:
+          EXPECTED_SHA: ${{ steps.source-sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(find bundles -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 2
+          for archive in bundles/*.tar.gz; do
+            checksum="$archive.sha256"
+            test -f "$checksum"
+            (cd bundles && sha256sum -c "$(basename "$checksum")")
+            actual_sha="$(tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^commit=/{print $2; exit}')"
+            test "$actual_sha" = "$EXPECTED_SHA" || {
+              echo "bundle source mismatch: archive=$archive expected=$EXPECTED_SHA actual=$actual_sha" >&2
+              exit 1
+            }
+          done
+
+      - name: Check staging SSH inputs
+        env:
+          STAGING_SSH_PRIVATE_KEY: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          STAGING_HOST: ${{ vars.STAGING_HOST }}
+          STAGING_USER: ${{ vars.STAGING_USER }}
+        run: |
+          set -euo pipefail
+          test -n "$STAGING_SSH_PRIVATE_KEY"
+          test -n "$STAGING_HOST"
+          test -n "$STAGING_USER"
+          case "$STAGING_HOST" in
+            ''|*[!A-Za-z0-9._:-]*) echo "STAGING_HOST contains unsupported characters" >&2; exit 1 ;;
+          esac
+
+      - name: Install SSH key and fixed host key
+        env:
+          STAGING_SSH_PRIVATE_KEY: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          STAGING_KNOWN_HOSTS: ${{ secrets.STAGING_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$STAGING_SSH_PRIVATE_KEY" > "$HOME/.ssh/p2wlan-staging"
+          chmod 600 "$HOME/.ssh/p2wlan-staging"
+          test -n "$STAGING_KNOWN_HOSTS"
+          printf '%s\n' "$STAGING_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Deploy exact built bundle
+        env:
+          STAGING_HOST: ${{ vars.STAGING_HOST }}
+          STAGING_USER: ${{ vars.STAGING_USER }}
+          STAGING_PORT: ${{ vars.STAGING_PORT || '22' }}
+          STAGING_MODE: ${{ inputs.deployment_mode || 'smoke-upload' }}
+          EXPECTED_SHA: ${{ steps.source-sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          bundle_dir="/tmp/p2wlan-staging-${GITHUB_RUN_ID}"
+          ssh_cmd=(ssh -i "$HOME/.ssh/p2wlan-staging" -p "$STAGING_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes "$STAGING_USER@$STAGING_HOST")
+          case "$STAGING_MODE" in
+            smoke-upload|install-upload) ;;
+            *) echo "unsupported STAGING_MODE=$STAGING_MODE" >&2; exit 1 ;;
+          esac
+          "${ssh_cmd[@]}" "umask 077; mkdir -p '$bundle_dir'"
+          scp -i "$HOME/.ssh/p2wlan-staging" -P "$STAGING_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            bundles/* scripts/staging/run-server-smoke.sh "$STAGING_USER@$STAGING_HOST:$bundle_dir/"
+          "${ssh_cmd[@]}" bash -s -- "$bundle_dir" "$EXPECTED_SHA" <<'REMOTE_VERIFY'
+          set -euo pipefail
+          bundle_dir=$1
+          expected_sha=$2
+          cd "$bundle_dir"
+          chmod 0755 run-server-smoke.sh
+          for checksum in *.tar.gz.sha256; do sha256sum -c "$checksum"; done
+          for archive in *.tar.gz; do
+            actual_sha="$(tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^commit=/{print $2; exit}')"
+            test "$actual_sha" = "$expected_sha" || {
+              echo "uploaded bundle source mismatch: $archive expected=$expected_sha actual=$actual_sha" >&2
+              exit 1
+            }
+          done
+          REMOTE_VERIFY
+
+          if [ "$STAGING_MODE" = smoke-upload ]; then
+            "${ssh_cmd[@]}" "cd '$bundle_dir'; ./run-server-smoke.sh '$bundle_dir' '$GITHUB_RUN_ID'"
+          else
+            "${ssh_cmd[@]}" "sudo -n true"
+            "${ssh_cmd[@]}" bash -s -- "$bundle_dir" "$EXPECTED_SHA" <<'REMOTE_INSTALL'
+          set -euo pipefail
+          bundle_dir=$1
+          expected_sha=$2
+          case "$(uname -m)" in
+            x86_64|amd64) arch=amd64 ;;
+            aarch64|arm64) arch=arm64 ;;
+            *) echo "unsupported staging architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          archive="$bundle_dir/p2wlan-server-linux-$arch.tar.gz"
+          checksum="$archive.sha256"
+          (cd "$bundle_dir" && sha256sum -c "$(basename "$checksum")")
+          actual_sha="$(tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^commit=/{print $2; exit}')"
+          test "$actual_sha" = "$expected_sha"
+          tar -xOf "$archive" p2wlan-server > "$bundle_dir/p2wlan-server"
+          tar -xOf "$archive" install-server.sh > "$bundle_dir/install-server.sh"
+          chmod 0755 "$bundle_dir/p2wlan-server" "$bundle_dir/install-server.sh"
+          if [ -e /opt/p2wlan-server/current ]; then
+            sudo -n install -m 0755 "$bundle_dir/p2wlan-server" /usr/local/bin/p2wlan-server
+            sudo -n p2wlan-server update --archive "$archive"
+          else
+            sudo -n "$bundle_dir/install-server.sh" --archive "$archive" --role all
+          fi
+          sudo -n p2wlan-server verify --service all
+          sudo -n p2wlan-server start --service all
+          sudo -n p2wlan-server check --service all
+          installed_sha="$(sudo -n tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^commit=/{print $2; exit}')"
+          test "$installed_sha" = "$expected_sha"
+          REMOTE_INSTALL
+          fi
+
+      - name: Remove staging upload
+        if: ${{ always() }}
+        env:
+          STAGING_HOST: ${{ vars.STAGING_HOST }}
+          STAGING_USER: ${{ vars.STAGING_USER }}
+          STAGING_PORT: ${{ vars.STAGING_PORT || '22' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${STAGING_HOST:-}" ] && [ -n "${STAGING_USER:-}" ] && [ -f "$HOME/.ssh/p2wlan-staging" ]; then
+            ssh -i "$HOME/.ssh/p2wlan-staging" -p "$STAGING_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              "$STAGING_USER@$STAGING_HOST" "rm -rf '/tmp/p2wlan-staging-${GITHUB_RUN_ID}'" || true
+          fi
+
+  release:
+    name: Publish server release
+    needs: build
+    if: ${{ startsWith(github.ref, 'refs/tags/server-v') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: p2wlan-server-linux-*-${{ github.sha }}
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release assets
+        working-directory: release-assets
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for checksum in *.tar.gz.sha256; do sha256sum -c "$checksum"; done
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 2
+          for archive in *.tar.gz; do
+            actual_sha="$(tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^commit=/{print $2; exit}')"
+            test "$actual_sha" = "$EXPECTED_SHA"
+          done
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --latest=false

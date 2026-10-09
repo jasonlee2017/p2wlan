@@ -1,0 +1,400 @@
+name: Flutter Client
+
+on:
+  push:
+    branches:
+      - main
+      - codex/**
+    paths:
+      - ".fvmrc"
+      - "apps/flutter_client/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "client/android-native/**"
+      - "client/tun/**"
+      - "scripts/build_android_native.sh"
+      # The daemon owns the authoritative status/route/event contract the
+      # Flutter client consumes; changes must re-run client tests + contract
+      # test (ADR 0004, P2-04).
+      - "client/daemon/src/diagnostics/**"
+      - "client/daemon/src/route/**"
+      - "client/daemon/src/connection_timeline.rs"
+      - "client/daemon/**"
+      - "client/tray/**"
+      # Shared daemon <-> client contract fixtures (single source of truth for
+      # the wire format; both sides must stay in lockstep).
+      - "contracts/**"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - ".fvmrc"
+      - "apps/flutter_client/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "client/android-native/**"
+      - "client/tun/**"
+      - "scripts/build_android_native.sh"
+      - "client/daemon/src/diagnostics/**"
+      - "client/daemon/src/route/**"
+      - "client/daemon/src/connection_timeline.rs"
+      - "client/daemon/**"
+      - "client/tray/**"
+      - "contracts/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+    inputs:
+      android_tun_mode:
+        description: "Android TUN mode for the APK experiment"
+        required: true
+        type: choice
+        options:
+          - async_fd
+          - dedicated_blocking
+        default: async_fd
+      android_wifi_low_latency:
+        description: "Request Android Wi-Fi full-low-latency lock"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: apps/flutter_client
+
+jobs:
+  analyze-test:
+    name: Analyze and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Dart format check
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+  android:
+    name: Android arm64 CI test APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Set up Rust Android targets
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: aarch64-linux-android
+
+      - name: Configure Android NDK for Rust bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+          ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+          echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Restore Flutter-managed source files before identity stamping
+        working-directory: .
+        shell: bash
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Assert clean Flutter client identity
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_commit="$(git rev-parse HEAD)"
+          expected_build_id="${expected_commit:0:12}"
+          identity="$(python3 scripts/release/flutter_client_build_identity.py apk --release)"
+          printf '%s\n' "$identity"
+          grep -Fx -- "--dart-define=P2WLAN_CLIENT_GIT_COMMIT=${expected_commit}" <<<"$identity"
+          grep -Fx -- "--dart-define=P2WLAN_CLIENT_BUILD_ID=${expected_build_id}" <<<"$identity"
+          grep -Fx -- "--dart-define=P2WLAN_CLIENT_DIRTY=false" <<<"$identity"
+          grep -Fx -- "--dart-define=P2WLAN_CLIENT_DIFF_HASH=" <<<"$identity"
+          if grep -Fq -- "-dirty-" <<<"$identity"; then
+            echo "Flutter client identity unexpectedly contains a dirty build ID" >&2
+            exit 1
+          fi
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Build arm64 release APK
+        env:
+          P2WLAN_ANDROID_ABIS: arm64-v8a
+          P2WLAN_ANDROID_TUN_MODE: ${{ inputs.android_tun_mode || 'async_fd' }}
+          P2WLAN_ANDROID_WIFI_LOW_LATENCY: ${{ inputs.android_wifi_low_latency || 'false' }}
+          # Ordinary CI never receives the production Android signing key.
+          # This is a release-mode, debug-signed test package and is never
+          # eligible for GitHub Release publication.
+          P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: "1"
+        run: >
+          bash ../../scripts/release/build_flutter_client.sh apk
+          --release
+          --target-platform android-arm64
+          --split-per-abi
+          --dart-define=P2WLAN_ANDROID_TUN_MODE=$P2WLAN_ANDROID_TUN_MODE
+          --dart-define=P2WLAN_ANDROID_WIFI_LOW_LATENCY=$P2WLAN_ANDROID_WIFI_LOW_LATENCY
+
+      - name: Verify APK contains only arm64-v8a
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+          test -f "$apk"
+          actual_abis="$(unzip -Z1 "$apk" \
+            | sed -n 's#^lib/\([^/]*\)/.*#\1#p' \
+            | sort -u \
+            | paste -sd, -)"
+          if [[ "$actual_abis" != "arm64-v8a" ]]; then
+            echo "Expected only arm64-v8a in $apk, found: ${actual_abis:-none}" >&2
+            exit 1
+          fi
+          echo "android_apk_sha256=$(sha256sum "$apk" | awk '{print $1}')"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-android-arm64-ci-test-apk
+          path: apps/flutter_client/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+
+  linux:
+    name: Linux x64 Release Bundle
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            liblzma-dev \
+            libsecret-1-dev \
+            libjsoncpp-dev
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Enable Linux desktop
+        run: flutter config --enable-linux-desktop
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build Linux daemon
+        working-directory: .
+        run: cargo build -p p2wlan-daemon --release
+
+      - name: Build Linux release bundle
+        run: flutter build linux --release
+
+      - name: Bundle Linux daemon
+        run: install -m 0755 ../../target/release/p2wlan-daemon build/linux/x64/release/bundle/p2wlan-daemon
+
+      - name: Pack Linux bundle
+        run: tar -C build/linux/x64/release/bundle -czf build/p2wlan-linux-x64-release.tar.gz .
+
+      - name: Upload Linux bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-linux-x64-release
+          path: apps/flutter_client/build/p2wlan-linux-x64-release.tar.gz
+
+  macos:
+    name: macOS Release Apps
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Enable macOS desktop
+        run: flutter config --enable-macos-desktop
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build macOS release app
+        run: flutter build macos --release
+
+      - name: Pack macOS apps by architecture
+        run: |
+          set -euo pipefail
+          src="build/macos/Build/Products/Release/P2WLAN.app"
+          for arch in arm64 x86_64; do
+            if [ "$arch" = "x86_64" ]; then
+              label="x64"
+            else
+              label="$arch"
+            fi
+            dst_dir="build/macos/Build/Products/Release/$label"
+            dst="$dst_dir/P2WLAN.app"
+            rm -rf "$dst_dir"
+            mkdir -p "$dst_dir"
+            cp -R "$src" "$dst"
+            for binary in \
+              "$dst/Contents/MacOS/P2WLAN" \
+              "$dst/Contents/Frameworks/App.framework/Versions/A/App" \
+              "$dst/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS"; do
+              lipo "$binary" -thin "$arch" -output "$binary.thin"
+              mv "$binary.thin" "$binary"
+            done
+            codesign --force --deep --sign - "$dst"
+            ditto -c -k --keepParent "$dst" "build/p2wlan-macos-$label-release.app.zip"
+          done
+
+      - name: Upload macOS apps
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-macos-release
+          path: apps/flutter_client/build/p2wlan-macos-*-release.app.zip
+
+  windows:
+    name: Windows x64 Release Bundle
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Enable Windows desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-windows-desktop
+
+      - name: Flutter pub get
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      # Flutter SDK migrations must not become part of the daemon/client
+      # identity. Restore them before compiling either side of the Windows
+      # package so the release stamp is clean and reproducible.
+      - name: Restore SDK-migrated files (pre-build)
+        working-directory: .
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Build Windows daemon
+        working-directory: .
+        run: cargo build -p p2wlan-daemon --release
+
+      - name: Build Windows release bundle
+        working-directory: apps/flutter_client
+        run: bash ../../scripts/release/build_flutter_client.sh windows --release
+
+      - name: Restore SDK-migrated files (post-build)
+        working-directory: .
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Verify clean Windows release source
+        working-directory: .
+        run: bash scripts/release/hermetic_build.sh check --release
+
+      - name: Bundle Windows daemon
+        shell: pwsh
+        working-directory: apps/flutter_client
+        run: Copy-Item "..\..\target\release\p2wlan-daemon.exe" "build\windows\x64\runner\Release\p2wlan-daemon.exe" -Force
+
+      - name: Bundle Wintun runtime
+        shell: pwsh
+        working-directory: apps/flutter_client
+        run: .\scripts\fetch_wintun.ps1 -DestinationDirectory "build\windows\x64\runner\Release" -Architecture amd64
+
+      - name: Bundle MSVC runtime
+        shell: pwsh
+        working-directory: apps/flutter_client
+        run: .\scripts\bundle_msvc_runtime.ps1 -DestinationDirectory "build\windows\x64\runner\Release"
+
+      - name: Run Windows startup integration tests
+        working-directory: apps/flutter_client
+        env:
+          P2WLAN_DAEMON_BIN: ${{ github.workspace }}/apps/flutter_client/build/windows/x64/runner/Release/p2wlan-daemon.exe
+        run: >
+          flutter test
+          test/windows_binary_probe_integration_test.dart
+          test/windows_tray_event_contract_test.dart
+
+      - name: Pack Windows bundle
+        shell: pwsh
+        working-directory: apps/flutter_client
+        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath build/p2wlan-windows-x64-release.zip -Force
+
+      - name: Upload Windows bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-windows-x64-release
+          path: apps/flutter_client/build/p2wlan-windows-x64-release.zip
+
+  ios:
+    name: iOS Compile
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Compile unsigned iOS release
+        run: flutter build ios --release --no-codesign

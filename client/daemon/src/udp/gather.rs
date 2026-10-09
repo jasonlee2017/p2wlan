@@ -1,0 +1,396 @@
+/// A STUN response received through the reader-owned transaction dispatcher.
+///
+/// Normal candidate gathering only needs the reflexive address, while RFC
+/// 5780 filtering probes also need the actual source address so a changed
+/// source can be classified without giving the probe its own UDP reader.
+struct LiveStunResponse {
+    source: SocketAddr,
+    mapped_address: Option<SocketAddr>,
+}
+
+impl UdpTransport {
+    /// Return the local UDP socket address.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.socket
+            .local_addr()
+            .map_err(|e| DaemonError::Network(format!("failed to read UDP local addr: {e}")))
+    }
+
+    /// Gather ICE-style candidate endpoints for this UDP socket.
+    pub async fn gather_candidates(
+        &self,
+        stun_servers: Vec<SocketAddr>,
+        stun_timeout: Duration,
+    ) -> Result<Vec<String>> {
+        let report = self
+            .gather_candidate_report(stun_servers, stun_timeout)
+            .await?;
+
+        Ok(report
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.endpoint.to_string())
+            .collect())
+    }
+
+    /// Gather ICE-style candidates plus STUN/NAT behavior diagnostics.
+    pub async fn gather_candidate_report(
+        &self,
+        stun_servers: Vec<SocketAddr>,
+        stun_timeout: Duration,
+    ) -> Result<CandidateGatherReport> {
+        let config = IceConfig {
+            stun_servers,
+            stun_timeout,
+            gather_host: self.peers.gather_host_candidates().await,
+            gather_srflx: true,
+        };
+
+        let mut report = gather_candidate_report(&self.socket, &config)
+            .await
+            .map_err(|e| DaemonError::Network(format!("ICE candidate gathering failed: {e}")))?;
+
+        if let Some(ipv6_socket) = self.ipv6_socket.as_ref() {
+            if let Ok(ipv6_report) = gather_candidate_report(ipv6_socket, &config).await {
+                self.append_ipv6_candidates(&mut report, ipv6_report.candidates)
+                    .await;
+            }
+        }
+
+        self.set_socket_pool_active(socket_pool_is_eligible(&report));
+        self.append_pool_socket_candidates_direct(&mut report, &config)
+            .await;
+        self.filter_predicted_candidates(&mut report).await;
+        Ok(report)
+    }
+
+    /// Gather candidates while `run_inbound` owns all reads from the UDP socket.
+    pub async fn gather_candidate_report_live(
+        &self,
+        stun_servers: Vec<SocketAddr>,
+        stun_timeout: Duration,
+    ) -> Result<CandidateGatherReport> {
+        let local_addr = self.local_addr()?;
+        let mut observations = Vec::with_capacity(stun_servers.len());
+
+        for server in &stun_servers {
+            if server.is_ipv4() != local_addr.is_ipv4() {
+                continue;
+            }
+            observations.push(
+                self.query_stun_live_on_socket(&self.socket, *server, stun_timeout)
+                    .await,
+            );
+        }
+
+        let mut report = candidate_report_from_observations(
+            local_addr,
+            self.peers.gather_host_candidates().await,
+            observations,
+        );
+
+        if let Some(ipv6_socket) = self.ipv6_socket.as_ref() {
+            if let Ok(ipv6_local_addr) = ipv6_socket.local_addr() {
+                let mut v6_observations = Vec::new();
+                for server in &stun_servers {
+                    if server.is_ipv6() {
+                        v6_observations.push(
+                            self.query_stun_live_on_socket(ipv6_socket, *server, stun_timeout)
+                                .await,
+                        );
+                    }
+                }
+                let ipv6_report = candidate_report_from_observations(
+                    ipv6_local_addr,
+                    self.peers.gather_host_candidates().await,
+                    v6_observations,
+                );
+                self.append_ipv6_candidates(&mut report, ipv6_report.candidates)
+                    .await;
+            }
+        }
+
+        self.set_socket_pool_active(socket_pool_is_eligible(&report));
+        self.append_pool_socket_candidates_live(&mut report, &stun_servers, stun_timeout)
+            .await;
+        self.filter_predicted_candidates(&mut report).await;
+        Ok(report)
+    }
+
+    async fn append_ipv6_candidates(
+        &self,
+        report: &mut CandidateGatherReport,
+        candidates: Vec<p2pnet_nat::IceCandidate>,
+    ) {
+        let mut discovered_stun_mappings = 0u64;
+        for candidate in candidates {
+            let is_stun = candidate.source == p2pnet_nat::CandidateSource::StunObserved;
+            let endpoint = candidate.endpoint.to_string();
+            if !report
+                .candidates
+                .iter()
+                .any(|existing| existing.endpoint.to_string() == endpoint)
+            {
+                if is_stun {
+                    discovered_stun_mappings = discovered_stun_mappings.saturating_add(1);
+                }
+                report.candidates.push(candidate);
+            }
+        }
+        if discovered_stun_mappings > 0 {
+            self.update_socket_diagnostics(IPV6_SOCKET_INDEX, |metrics| {
+                metrics.stun_mappings_discovered = metrics
+                    .stun_mappings_discovered
+                    .saturating_add(discovered_stun_mappings);
+            })
+            .await;
+        }
+    }
+
+    /// The static-STUN ablation must remove predicted candidates after every
+    /// gathering source, including optional socket-pool observers. Filtering
+    /// here also leaves the NAT profile intact for diagnostics and for the
+    /// independent fresh/birthday policy gates.
+    async fn filter_predicted_candidates(&self, report: &mut CandidateGatherReport) {
+        if self.peers.predicted_candidates_enabled().await {
+            return;
+        }
+        report
+            .candidates
+            .retain(|candidate| candidate.source != p2pnet_nat::CandidateSource::Predicted);
+    }
+
+    async fn query_stun_live_on_socket(
+        &self,
+        socket: &UdpSocket,
+        server: SocketAddr,
+        stun_timeout: Duration,
+    ) -> StunObservation {
+        let started = Instant::now();
+        let result = self
+            .query_stun_live_response(socket, server, stun_timeout, false, false)
+            .await
+            .and_then(|response| {
+                response
+                    .mapped_address
+                    .ok_or_else(|| "STUN response has no mapped address".to_string())
+            });
+
+        match result {
+            Ok(mapped_address) => StunObservation {
+                server: server.to_string(),
+                mapped_address: Some(mapped_address.to_string()),
+                rtt_ms: Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+                error: None,
+            },
+            Err(error) => StunObservation {
+                server: server.to_string(),
+                mapped_address: None,
+                rtt_ms: None,
+                error: Some(error),
+            },
+        }
+    }
+
+    /// Send one STUN request through the reader-owned waiter registry. Normal
+    /// requests require a response from the queried server; CHANGE-REQUEST
+    /// probes intentionally accept a response from the server's alternate
+    /// address so the caller can classify filtering behavior.
+    async fn query_stun_live_response(
+        &self,
+        socket: &UdpSocket,
+        server: SocketAddr,
+        stun_timeout: Duration,
+        change_ip: bool,
+        change_port: bool,
+    ) -> std::result::Result<LiveStunResponse, String> {
+        let mut request = StunMessage::binding_request();
+        request.add_attribute(StunAttribute::Software("P2WLAN/0.1".to_string()));
+        if change_ip || change_port {
+            request.add_attribute(StunAttribute::ChangeRequest {
+                change_ip,
+                change_port,
+            });
+        }
+        let transaction_id = request.transaction_id;
+        let encoded = request.encode();
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let _registration = self
+            .stun_waiters
+            .register(transaction_id, response_tx)
+            .map_err(|error| error.reason().to_string())?;
+        let deadline = tokio::time::Instant::now() + stun_timeout;
+
+        // Send readiness and response share one deadline. Dropping this future
+        // also drops the exact waiter lease, even when no reply ever arrives.
+        async {
+            self.send_mapping_request_until(socket, &encoded, server, deadline, &|| true)
+                .await
+                .map_err(|error| format!("STUN send failed: {error:?}"))?;
+            let StunResponse { data, source } =
+                dynamic_punch::wait_for_mapping_io(response_rx, deadline, &|| true)
+                    .await
+                    .map_err(|error| format!("STUN response wait failed: {error:?}"))?
+                    .map_err(|_| "STUN response dispatcher closed".to_string())?;
+            if !change_ip && !change_port && source != server {
+                return Err(format!(
+                    "response source mismatch: expected {server}, received {source}"
+                ));
+            }
+            let response = StunMessage::decode(&data)
+                .map_err(|error| format!("invalid STUN response: {error}"))?;
+            if response.transaction_id != transaction_id {
+                return Err("STUN transaction ID mismatch".to_string());
+            }
+            if response.msg_type != BINDING_RESPONSE {
+                if let Some((code, reason)) = response.get_error_code() {
+                    return Err(format!("STUN error response: {code} {reason}"));
+                }
+                return Err(format!(
+                    "unexpected STUN message type: 0x{:04X}",
+                    response.msg_type
+                ));
+            }
+            Ok(LiveStunResponse {
+                source,
+                mapped_address: response.get_reflexive_address(),
+            })
+        }
+        .await
+    }
+
+    async fn append_pool_socket_candidates_direct(
+        &self,
+        report: &mut CandidateGatherReport,
+        config: &IceConfig,
+    ) {
+        if self.socket_count() <= 1 {
+            return;
+        }
+
+        let servers = pool_stun_servers(&config.stun_servers, self.local_addr().ok());
+        for (socket_index, socket) in self.active_sockets().iter().enumerate().skip(1) {
+            let observations = self
+                .query_stun_direct(socket, &servers, config.stun_timeout)
+                .await;
+            let Some(local_addr) = socket.local_addr().ok() else {
+                continue;
+            };
+            let pool_report = candidate_report_from_observations(local_addr, false, observations);
+            self.append_pool_candidates(report, pool_report.candidates, socket_index)
+                .await;
+        }
+    }
+
+    async fn append_pool_socket_candidates_live(
+        &self,
+        report: &mut CandidateGatherReport,
+        stun_servers: &[SocketAddr],
+        stun_timeout: Duration,
+    ) {
+        if self.socket_count() <= 1 {
+            return;
+        }
+
+        let servers = pool_stun_servers(stun_servers, self.local_addr().ok());
+        for (socket_index, socket) in self.active_sockets().iter().enumerate().skip(1) {
+            let mut observations = Vec::with_capacity(servers.len());
+            for server in &servers {
+                observations.push(
+                    self.query_stun_live_on_socket(socket, *server, stun_timeout)
+                        .await,
+                );
+            }
+            let Some(local_addr) = socket.local_addr().ok() else {
+                continue;
+            };
+            let pool_report = candidate_report_from_observations(local_addr, false, observations);
+            self.append_pool_candidates(report, pool_report.candidates, socket_index)
+                .await;
+        }
+    }
+
+    async fn query_stun_direct(
+        &self,
+        socket: &UdpSocket,
+        servers: &[SocketAddr],
+        stun_timeout: Duration,
+    ) -> Vec<StunObservation> {
+        if socket.local_addr().is_err() {
+            return Vec::new();
+        }
+        let client = StunClient::with_timeout(stun_timeout);
+        let mut observations = Vec::with_capacity(servers.len());
+        for server in servers {
+            let started = Instant::now();
+            let observation = match client.binding_request(socket, *server).await {
+                Ok(response) => StunObservation {
+                    server: server.to_string(),
+                    mapped_address: response
+                        .reflexive_address
+                        .map(|address| address.to_string()),
+                    rtt_ms: Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+                    error: None,
+                },
+                Err(error) => StunObservation {
+                    server: server.to_string(),
+                    mapped_address: None,
+                    rtt_ms: None,
+                    error: Some(error.to_string()),
+                },
+            };
+            observations.push(observation);
+        }
+        observations
+    }
+
+    async fn append_pool_candidates(
+        &self,
+        report: &mut CandidateGatherReport,
+        candidates: Vec<p2pnet_nat::IceCandidate>,
+        socket_index: usize,
+    ) {
+        let discovered_stun_mappings = merge_pool_candidates(report, candidates);
+        if discovered_stun_mappings > 0 {
+            self.update_socket_diagnostics(socket_index, |metrics| {
+                metrics.stun_mappings_discovered = metrics
+                    .stun_mappings_discovered
+                    .saturating_add(discovered_stun_mappings)
+            })
+            .await;
+        }
+    }
+}
+
+fn merge_pool_candidates(
+    report: &mut CandidateGatherReport,
+    candidates: Vec<p2pnet_nat::IceCandidate>,
+) -> u64 {
+    let mut discovered_stun_mappings = 0u64;
+    for candidate in candidates {
+        let is_stun_observed = candidate.source == p2pnet_nat::CandidateSource::StunObserved;
+        if is_stun_observed {
+            discovered_stun_mappings = discovered_stun_mappings.saturating_add(1);
+        }
+
+        let endpoint = candidate.endpoint.to_string();
+        if let Some(existing) = report
+            .candidates
+            .iter_mut()
+            .find(|existing| existing.endpoint.to_string() == endpoint)
+        {
+            // A later pool socket can observe a port that an earlier socket
+            // merely predicted. Keep the endpoint once, but promote the
+            // evidence so signaling and probe ranking treat it as real.
+            if is_stun_observed && existing.source == p2pnet_nat::CandidateSource::Predicted {
+                existing.source = p2pnet_nat::CandidateSource::StunObserved;
+                existing.candidate_type = candidate.candidate_type;
+                existing.priority = existing.priority.max(candidate.priority);
+            }
+            continue;
+        }
+        report.candidates.push(candidate);
+    }
+    discovered_stun_mappings
+}

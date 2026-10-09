@@ -1,0 +1,788 @@
+#[derive(Clone, Default)]
+struct PunchAttemptDeduplicator {
+    state: Arc<std::sync::Mutex<PunchAttemptState>>,
+}
+
+#[derive(Default)]
+struct PunchAttemptState {
+    next_session_id: u64,
+    active: HashMap<String, PunchAttemptRecord>,
+    /// Highest peer lifecycle which has crossed an authoritative cleanup
+    /// boundary.  Keep the tombstone after the active permit is removed: an
+    /// old task may have captured that lifecycle before cleanup and reach its
+    /// claim only afterwards.
+    retired_peer_sessions: HashMap<String, crate::peer::PeerSessionGeneration>,
+}
+
+struct PunchAttemptRecord {
+    session_id: u64,
+    peer_session_generation: crate::peer::PeerSessionGeneration,
+    priority: u8,
+    /// Recovery epoch the claim belongs to (0 for epoch-less legacy claims).
+    /// A claim from a different non-zero epoch normally supersedes the active
+    /// session. A same-generation plan that reaches the short rendezvous lead
+    /// is folded instead, so a candidate refresh cannot erase its first send.
+    epoch: u64,
+    /// Identity of the fresh-mapping prediction backing this session, when
+    /// the session is a fresh-prediction claim.  Ordering is lexicographic on
+    /// (incarnation boot epoch, generation): a newer incarnation supersedes
+    /// an older one, and within one incarnation a newer generation wins.
+    fresh_generation: Option<crate::FreshPredictionId>,
+    /// Local network generation captured when this punch plan was admitted.
+    /// Epochs normally rotate with this value, but keeping it on the active
+    /// permit makes a generation-changing replacement explicit rather than
+    /// looking like an arbitrary dedup cancellation.
+    network_generation: u64,
+    /// Relay-coordinated first-send target for this session. A non-fresh
+    /// candidate update inside the same epoch must not re-clock this window.
+    punch_at_ms: Option<u64>,
+    /// Set at the dispatch boundary immediately before the first owned send
+    /// sweep. It gives a short, bounded protection interval to a rendezvous
+    /// that has already reached its first-send edge.
+    first_send_started_at_ms: Option<u64>,
+    /// Number of owners holding this dedup record. The primary worker may
+    /// hand one ownership reference to a Hard↔Hard cleanup watcher so a
+    /// lower-priority retry cannot claim the peer while the exact UDP/ledger
+    /// cleanup transaction is still in flight.
+    owner_count: usize,
+    cancellation: Arc<PunchSessionCancellation>,
+}
+
+/// Why a new trigger was deliberately folded into the active punch plan.
+///
+/// This is separate from a hard cancellation: callers use it to record that
+/// a candidate refresh or fresh prediction did not silently erase a valid
+/// first rendezvous window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PunchClaimDeferredReason {
+    SameEpochActive,
+    CancelledOwnerCleanup,
+    LowerPriorityActive,
+    SameOrOlderFreshPrediction,
+    RendezvousLeadProtected,
+    FirstSendProtected,
+}
+
+impl PunchClaimDeferredReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SameEpochActive => "same_epoch_active_session",
+            Self::CancelledOwnerCleanup => "cancelled_owner_cleanup_pending",
+            Self::LowerPriorityActive => "higher_priority_active_session",
+            Self::SameOrOlderFreshPrediction => "same_or_older_fresh_prediction",
+            Self::RendezvousLeadProtected => "active_rendezvous_lead_protected",
+            Self::FirstSendProtected => "active_first_send_protected",
+        }
+    }
+}
+
+/// Details of an incoming trigger that was merged into an active plan.
+#[derive(Debug, Clone, Copy)]
+struct DeferredPunchClaim {
+    active_session_id: u64,
+    active_epoch: u64,
+    active_network_generation: u64,
+    active_punch_at_ms: Option<u64>,
+    reason: PunchClaimDeferredReason,
+}
+
+/// Result of claiming a relay-coordinated synchronized punch.
+///
+/// Unlike the legacy `Option` return, this preserves the reason and active
+/// plan identity when a trigger is folded into a currently valid window.
+enum RendezvousPunchClaim {
+    Claimed(PunchSessionPermit),
+    Deferred(DeferredPunchClaim),
+    /// The caller belongs to a lifecycle which was already retired, or is
+    /// older than the active replacement owner.  Unlike `Deferred`, there is
+    /// no valid active rendezvous for this caller to merge into.
+    RejectedStalePeerSession,
+}
+
+/// Explicit reason recorded by a cancelled permit. The cancellation itself
+/// remains synchronous so it can still stop an owned worker at its next gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PunchCancellationReason {
+    PeerLifecycle,
+    NetworkGenerationChanged,
+    RecoveryEpochChanged,
+    SynchronizedPreemptedBackground,
+    FreshPredictionPreempted,
+}
+
+impl PunchCancellationReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PeerLifecycle => "peer_lifecycle",
+            Self::NetworkGenerationChanged => "network_generation_changed",
+            Self::RecoveryEpochChanged => "recovery_epoch_changed",
+            Self::SynchronizedPreemptedBackground => "synchronized_preempted_background",
+            Self::FreshPredictionPreempted => "fresh_prediction_preempted",
+        }
+    }
+}
+
+/// Background retry / birthday sweep sessions.  Never preempts anything.
+const PUNCH_PRIORITY_BACKGROUND: u8 = 0;
+/// Ordinary synchronized punch (candidate refresh, handshake offers).
+const PUNCH_PRIORITY_SYNCHRONIZED: u8 = 1;
+/// Synchronized punch triggered by a fresh-mapping prediction signal.
+///
+/// The peer measured its NAT port sequence and signaled a predicted window;
+/// this session must preempt every older ordinary/birthday session so the
+/// prediction is used while it is still fresh.
+const PUNCH_PRIORITY_FRESH_PREDICTION: u8 = 2;
+/// A bilateral measured rendezvous cannot be ordered against a one-sided
+/// prediction's boot/generation ID. Give it its own priority while retaining
+/// the same lifecycle fences and bounded first-send protection below.
+const PUNCH_PRIORITY_HARD_HARD: u8 = 3;
+
+#[derive(Debug, Default)]
+pub(crate) struct PunchSessionCancellation {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+    reason: std::sync::Mutex<Option<PunchCancellationReason>>,
+}
+
+struct PunchSessionPermit {
+    owner: PunchAttemptDeduplicator,
+    peer_id: String,
+    session_id: u64,
+    cancellation: Arc<PunchSessionCancellation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PunchSessionOutcome {
+    Completed,
+    Cancelled,
+    DeadlineExceeded,
+}
+
+impl PunchSessionCancellation {
+    /// External lifecycle and test cancellation. Scheduler replacements use
+    /// `cancel_with_reason` so their precise cause remains observable.
+    #[cfg(test)]
+    pub(crate) fn cancel(&self) {
+        self.cancel_with_reason(PunchCancellationReason::PeerLifecycle);
+    }
+
+    fn cancel_with_reason(&self, reason: PunchCancellationReason) {
+        let mut recorded = self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if recorded.is_none() {
+            *recorded = Some(reason);
+        }
+        drop(recorded);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Cancel a Hard↔Hard session from the bounded manager ledger.  The
+    /// manager cannot own the non-cloneable punch permit, but it can still
+    /// wake the measurement/sweep/cleanup workers through this shared handle.
+    pub(crate) fn cancel_for_hard_hard_cleanup(&self) {
+        self.cancel_with_reason(PunchCancellationReason::PeerLifecycle);
+    }
+
+    fn cancellation_reason(&self) -> Option<PunchCancellationReason> {
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl PunchSessionPermit {
+    async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    /// Handle for watchers that must observe this session's cancellation
+    /// (e.g. cleanup of a provisional fresh-mapping socket whose owning work
+    /// future may be dropped at an await point).
+    pub(crate) fn cancellation_handle(&self) -> Arc<PunchSessionCancellation> {
+        self.cancellation.clone()
+    }
+
+    fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    fn cancellation_reason(&self) -> Option<PunchCancellationReason> {
+        self.cancellation.cancellation_reason()
+    }
+
+    /// Mark the first owned UDP send dispatch. This is deliberately a
+    /// synchronous operation: a concurrent fresh signal sees the protection
+    /// before it can cancel the rendezvous whose first packet is about to
+    /// leave the socket.
+    fn mark_first_send_started(&self) -> u64 {
+        self.owner
+            .mark_first_send_started(&self.peer_id, self.session_id)
+    }
+
+    /// Keep the exact dedup record owned by a cleanup watcher after the
+    /// short-lived worker releases its own permit. This is intentionally a
+    /// synchronous handoff: no await can interleave between the worker's
+    /// release and the cleanup owner's claim of the same record.
+    pub(crate) fn clone_for_cleanup(&self) -> Self {
+        self.owner.retain(&self.peer_id, self.session_id);
+        Self {
+            owner: self.owner.clone(),
+            peer_id: self.peer_id.clone(),
+            session_id: self.session_id,
+            cancellation: self.cancellation.clone(),
+        }
+    }
+}
+
+impl Drop for PunchSessionPermit {
+    fn drop(&mut self) {
+        self.owner.release(&self.peer_id, self.session_id);
+    }
+}
+
+impl PunchAttemptDeduplicator {
+    #[cfg(test)]
+    async fn claim(&self, peer_id: &str) -> Option<PunchSessionPermit> {
+        self.claim_with_priority(
+            peer_id,
+            crate::peer::PeerSessionGeneration::for_test(1),
+            0,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    async fn claim_with_window(
+        &self,
+        peer_id: &str,
+        _window: Duration,
+    ) -> Option<PunchSessionPermit> {
+        self.claim_with_priority(
+            peer_id,
+            crate::peer::PeerSessionGeneration::for_test(1),
+            0,
+            PUNCH_PRIORITY_BACKGROUND,
+            None,
+        )
+    }
+
+    /// Claim the punch session for a recovery-epoch-scoped trigger.
+    ///
+    /// All production punch entry points (offers, fresh predictions,
+    /// background retries, peer-reflexive observations) claim through here:
+    /// the epoch is the authoritative `(peer_id, generation, epoch)` plan
+    /// identity, so a new plan always supersedes the active session while
+    /// triggers inside the SAME plan follow the priority rules below.
+    async fn claim_for_epoch_for_peer_session(
+        &self,
+        peers: &PeerManager,
+        peer_id: &str,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+        epoch: u64,
+        priority: u8,
+        fresh_generation: Option<crate::FreshPredictionId>,
+    ) -> Option<PunchSessionPermit> {
+        if !peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
+            return None;
+        }
+        let session = self.claim_with_priority(
+            peer_id,
+            peer_session_generation,
+            epoch,
+            priority,
+            fresh_generation,
+        )?;
+        if peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
+            Some(session)
+        } else {
+            drop(session);
+            None
+        }
+    }
+
+    /// Claim a relay-coordinated rendezvous session with the complete plan
+    /// identity. Same-generation refreshes are folded into an active first
+    /// window; only a real generation change can bypass that short protection.
+    #[allow(clippy::too_many_arguments)]
+    async fn claim_for_epoch_with_rendezvous_for_peer_session(
+        &self,
+        peers: &PeerManager,
+        peer_id: &str,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+        network_generation: u64,
+        epoch: u64,
+        priority: u8,
+        fresh_generation: Option<crate::FreshPredictionId>,
+        punch_at_ms: Option<u64>,
+    ) -> Option<RendezvousPunchClaim> {
+        if peers.current_network_generation_sync() != network_generation
+            || !peers.peer_session_is_current_sync(peer_id, peer_session_generation)
+        {
+            return None;
+        }
+        let claim = self.claim_with_rendezvous(
+            peer_id,
+            peer_session_generation,
+            network_generation,
+            epoch,
+            priority,
+            fresh_generation,
+            punch_at_ms,
+        );
+        if peers.current_network_generation_sync() != network_generation
+            || !peers.peer_session_is_current_sync(peer_id, peer_session_generation)
+        {
+            if let RendezvousPunchClaim::Claimed(session) = claim {
+                drop(session);
+            }
+            return None;
+        }
+        match claim {
+            RendezvousPunchClaim::RejectedStalePeerSession => None,
+            claim => Some(claim),
+        }
+    }
+
+    /// Test compatibility for scheduler-only tests which do not construct a
+    /// PeerManager lifecycle. Production callers must use the guarded variant
+    /// above and pass the exact admission-time generation.
+    #[cfg(test)]
+    async fn claim_for_epoch_with_rendezvous(
+        &self,
+        peer_id: &str,
+        network_generation: u64,
+        epoch: u64,
+        priority: u8,
+        fresh_generation: Option<crate::FreshPredictionId>,
+        punch_at_ms: Option<u64>,
+    ) -> RendezvousPunchClaim {
+        self.claim_with_rendezvous(
+            peer_id,
+            crate::peer::PeerSessionGeneration::for_test(1),
+            network_generation,
+            epoch,
+            priority,
+            fresh_generation,
+            punch_at_ms,
+        )
+    }
+
+    /// Claim the punch session for a fresh-mapping prediction signal.
+    ///
+    /// `signal_id` is the incarnation+generation identity carried by the
+    /// offer that delivered the predicted window.  A newer fresh prediction
+    /// supersedes an older one at the same priority (including one from an
+    /// older daemon incarnation); any older ordinary or background session is
+    /// cancelled immediately.
+    #[cfg(test)]
+    async fn claim_fresh_prediction(
+        &self,
+        peer_id: &str,
+        signal_id: crate::FreshPredictionId,
+    ) -> Option<PunchSessionPermit> {
+        self.claim_with_priority(
+            peer_id,
+            crate::peer::PeerSessionGeneration::for_test(1),
+            0,
+            PUNCH_PRIORITY_FRESH_PREDICTION,
+            Some(signal_id),
+        )
+    }
+
+    fn claim_with_priority(
+        &self,
+        peer_id: &str,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+        epoch: u64,
+        priority: u8,
+        fresh_generation: Option<crate::FreshPredictionId>,
+    ) -> Option<PunchSessionPermit> {
+        match self.claim_with_rendezvous(
+            peer_id,
+            peer_session_generation,
+            0,
+            epoch,
+            priority,
+            fresh_generation,
+            None,
+        ) {
+            RendezvousPunchClaim::Claimed(permit) => Some(permit),
+            RendezvousPunchClaim::Deferred(_) | RendezvousPunchClaim::RejectedStalePeerSession => {
+                None
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn claim_with_rendezvous(
+        &self,
+        peer_id: &str,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+        network_generation: u64,
+        epoch: u64,
+        priority: u8,
+        fresh_generation: Option<crate::FreshPredictionId>,
+        punch_at_ms: Option<u64>,
+    ) -> RendezvousPunchClaim {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .retired_peer_sessions
+            .get(peer_id)
+            .is_some_and(|retired| peer_session_generation <= *retired)
+        {
+            return RendezvousPunchClaim::RejectedStalePeerSession;
+        }
+        if let Some(active) = state.active.get(peer_id) {
+            if peer_session_generation < active.peer_session_generation {
+                return RendezvousPunchClaim::RejectedStalePeerSession;
+            }
+            let lifecycle_preempts = peer_session_generation > active.peer_session_generation;
+            let generation_preempts = active.network_generation != 0
+                && network_generation != 0
+                && active.network_generation != network_generation;
+            let epoch_preempts = active.epoch != 0 && epoch != 0 && active.epoch != epoch;
+            let priority_preempts = active.priority < priority;
+            let newer_fresh_preempts = active.priority == priority
+                && priority == PUNCH_PRIORITY_FRESH_PREDICTION
+                && active
+                    .fresh_generation
+                    .is_some_and(|active_id| fresh_generation.is_some_and(|id| id > active_id));
+            let preempt = lifecycle_preempts
+                || generation_preempts
+                || epoch_preempts
+                || priority_preempts
+                || newer_fresh_preempts;
+            if !preempt {
+                let reason = if priority == PUNCH_PRIORITY_HARD_HARD
+                    && active.priority == PUNCH_PRIORITY_HARD_HARD
+                    && active.cancellation.is_cancelled()
+                {
+                    PunchClaimDeferredReason::CancelledOwnerCleanup
+                } else if priority < active.priority {
+                    PunchClaimDeferredReason::LowerPriorityActive
+                } else if priority == PUNCH_PRIORITY_FRESH_PREDICTION {
+                    PunchClaimDeferredReason::SameOrOlderFreshPrediction
+                } else {
+                    PunchClaimDeferredReason::SameEpochActive
+                };
+                return RendezvousPunchClaim::Deferred(DeferredPunchClaim {
+                    active_session_id: active.session_id,
+                    active_epoch: active.epoch,
+                    active_network_generation: active.network_generation,
+                    active_punch_at_ms: active.punch_at_ms,
+                    reason,
+                });
+            }
+
+            // Candidate refresh and a newer fresh prediction remain useful,
+            // but cannot erase a same-generation rendezvous once it reached
+            // the lead or first-send edge. The caller records and stashes the
+            // newest trusted target for the active session instead.
+            if !lifecycle_preempts
+                && !generation_preempts
+                && active.first_send_is_protected(now_unix_millis())
+            {
+                let reason = if active.first_send_started_at_ms.is_some() {
+                    PunchClaimDeferredReason::FirstSendProtected
+                } else {
+                    PunchClaimDeferredReason::RendezvousLeadProtected
+                };
+                return RendezvousPunchClaim::Deferred(DeferredPunchClaim {
+                    active_session_id: active.session_id,
+                    active_epoch: active.epoch,
+                    active_network_generation: active.network_generation,
+                    active_punch_at_ms: active.punch_at_ms,
+                    reason,
+                });
+            }
+
+            let reason = if lifecycle_preempts {
+                PunchCancellationReason::PeerLifecycle
+            } else if generation_preempts {
+                PunchCancellationReason::NetworkGenerationChanged
+            } else if epoch_preempts {
+                PunchCancellationReason::RecoveryEpochChanged
+            } else if priority >= PUNCH_PRIORITY_FRESH_PREDICTION {
+                PunchCancellationReason::FreshPredictionPreempted
+            } else {
+                PunchCancellationReason::SynchronizedPreemptedBackground
+            };
+            active.cancellation.cancel_with_reason(reason);
+        }
+
+        state.next_session_id = state.next_session_id.wrapping_add(1).max(1);
+        let session_id = state.next_session_id;
+        let cancellation = Arc::new(PunchSessionCancellation::default());
+        state.active.insert(
+            peer_id.to_string(),
+            PunchAttemptRecord {
+                session_id,
+                peer_session_generation,
+                priority,
+                epoch,
+                fresh_generation,
+                network_generation,
+                punch_at_ms,
+                first_send_started_at_ms: None,
+                owner_count: 1,
+                cancellation: cancellation.clone(),
+            },
+        );
+        RendezvousPunchClaim::Claimed(PunchSessionPermit {
+            owner: self.clone(),
+            peer_id: peer_id.to_string(),
+            session_id,
+            cancellation,
+        })
+    }
+
+    fn mark_first_send_started(&self, peer_id: &str, session_id: u64) -> u64 {
+        let now = now_unix_millis();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(active) = state.active.get_mut(peer_id) {
+            if active.session_id == session_id {
+                return *active.first_send_started_at_ms.get_or_insert(now);
+            }
+        }
+        now
+    }
+
+    fn release(&self, peer_id: &str, session_id: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .active
+            .get(peer_id)
+            .is_some_and(|active| active.session_id == session_id)
+        {
+            let remove = state
+                .active
+                .get_mut(peer_id)
+                .map(|active| {
+                    active.owner_count = active.owner_count.saturating_sub(1);
+                    active.owner_count == 0
+                })
+                .unwrap_or(false);
+            if remove {
+                state.active.remove(peer_id);
+            }
+        }
+    }
+
+    fn retain(&self, peer_id: &str, session_id: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(active) = state
+            .active
+            .get_mut(peer_id)
+            .filter(|active| active.session_id == session_id)
+        {
+            active.owner_count = active.owner_count.saturating_add(1);
+        }
+    }
+
+    /// An exact cancelled owner still holds its UDP cleanup transaction.
+    /// Observe the authoritative permit ledger until its last reference is
+    /// released, without preempting cleanup or retaining a lock across await.
+    /// The caller retries once and rechecks all lifecycle/time fences.
+    async fn wait_for_cancelled_owner_release(
+        &self,
+        peer_id: &str,
+        session_id: u64,
+        max_wait: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let pending = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active
+                .get(peer_id)
+                .is_some_and(|active| {
+                    active.session_id == session_id && active.cancellation.is_cancelled()
+                });
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !pending || remaining.is_zero() {
+                return;
+            }
+            sleep(remaining.min(Duration::from_millis(20))).await;
+        }
+    }
+
+    /// A locally measured HH owner claims fresh priority before its session
+    /// record exists. Ordinary fresh predictions instead carry their remote
+    /// prediction identity. Consult this same permit ledger during candidate
+    /// deferral so measurement cannot be invalidated by unrelated refreshes.
+    fn has_local_fresh_owner(
+        &self,
+        peer_id: &str,
+        network_generation: u64,
+        peer_session: Option<crate::peer::PeerSessionGeneration>,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .get(peer_id)
+            .is_some_and(|active| {
+                active.priority == PUNCH_PRIORITY_HARD_HARD
+                    && active.fresh_generation.is_none()
+                    && active.network_generation == network_generation
+                    && Some(active.peer_session_generation) == peer_session
+                    && !active.cancellation.is_cancelled()
+            })
+    }
+
+    /// Cancel the current owner without retiring its peer lifecycle. This is
+    /// for Direct convergence and quarantine, not roster endpoint metadata.
+    /// Structural cleanup must use `retire_peer_session` instead.
+    pub(crate) fn cancel(&self, peer_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(active) = state.active.remove(peer_id) {
+            active
+                .cancellation
+                .cancel_with_reason(PunchCancellationReason::PeerLifecycle);
+        }
+    }
+
+    /// Retire one exact peer lifecycle and cancel only an owner from that
+    /// lifecycle (or an older one). The tombstone makes cancel-before-claim a
+    /// real barrier: a delayed task cannot reinsert itself after cleanup, and a
+    /// late cleanup for an old lifecycle cannot cancel a newer replacement.
+    pub(crate) fn retire_peer_session(
+        &self,
+        peer_id: &str,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .retired_peer_sessions
+            .entry(peer_id.to_string())
+            .and_modify(|retired| *retired = (*retired).max(peer_session_generation))
+            .or_insert(peer_session_generation);
+        let should_remove = state
+            .active
+            .get(peer_id)
+            .is_some_and(|active| active.peer_session_generation <= peer_session_generation);
+        if should_remove {
+            if let Some(active) = state.active.remove(peer_id) {
+                active
+                    .cancellation
+                    .cancel_with_reason(PunchCancellationReason::PeerLifecycle);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn active_session_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .len()
+    }
+}
+
+impl PunchAttemptRecord {
+    fn first_send_is_protected(&self, now_ms: u64) -> bool {
+        let guard_ms = RELAY_ASSISTED_PUNCH_LEAD.as_millis() as u64;
+        if let Some(first_send_started_at_ms) = self.first_send_started_at_ms {
+            return now_ms.saturating_sub(first_send_started_at_ms) <= guard_ms;
+        }
+        let Some(punch_at_ms) = self.punch_at_ms else {
+            return false;
+        };
+        let lead_start = punch_at_ms.saturating_sub(guard_ms);
+        let lead_end = punch_at_ms.saturating_add(guard_ms);
+        (lead_start..=lead_end).contains(&now_ms)
+    }
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// Run a punch session with a caller-chosen hard deadline.
+///
+/// Wide remote-scatter sweeps plan hundreds of ports across multiple sockets
+/// and need a deadline derived from the actual probe schedule instead of the
+/// fixed 24s bound, which kills them mid-scan before the tail of the birthday
+/// window has been covered.
+async fn run_owned_punch_session_with_deadline<F>(
+    session: &PunchSessionPermit,
+    deadline: Duration,
+    work: F,
+) -> PunchSessionOutcome
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        _ = session.cancelled() => PunchSessionOutcome::Cancelled,
+        _ = sleep(deadline) => PunchSessionOutcome::DeadlineExceeded,
+        _ = work => PunchSessionOutcome::Completed,
+    }
+}
+
+fn should_cancel_maintenance_offer(
+    is_rekey: bool,
+    has_session: bool,
+    needs_rekey: bool,
+    expired: bool,
+    has_pending_responder: bool,
+) -> bool {
+    if has_pending_responder {
+        return true;
+    }
+    if is_rekey {
+        has_session && !needs_rekey && !expired
+    } else {
+        has_session
+    }
+}

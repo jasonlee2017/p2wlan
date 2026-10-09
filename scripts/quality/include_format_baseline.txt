@@ -1,0 +1,8 @@
+# Rust sources reached through include! that `cargo fmt --all --check` cannot see.
+# cargo fmt follows `mod`, not `include!`, so rustfmt never inspected these.
+#   drift <path>    -> rustfmt would rewrite it today (inherited drift)
+#   fragment <path> -> a syntactic fragment spliced into another item;
+#                      rustfmt can only parse it in that context
+# Neither list is an exemption: both may only shrink. Format a drift entry
+# and drop it; if a fragment becomes a standalone file, move it to drift.
+# 0 drift, 0 fragment.

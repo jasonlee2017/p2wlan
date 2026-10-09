@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import hashlib
+import json
+import plistlib
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from release_assets import OPENWRT_PRIMARY
+
+ROOT = Path(__file__).resolve().parents[2]
+VERIFY = ROOT / "scripts/release/verify_release_set.py"
+WRITE_METADATA = ROOT / "scripts/release/write_artifact_metadata.py"
+SOURCE_SHA = "0123456789abcdef0123456789abcdef01234567"
+TAG = "v1.2.3"
+PRIMARY = {
+    "p2wlan-android-arm64-release.apk": ("android", "arm64", "client-stamped"),
+    "p2wlan-ios-arm64-unsigned.ipa": ("ios", "arm64", "client-stamped"),
+    "p2wlan-linux-arm64-cli.tar.gz": ("linux-cli", "arm64", "rust-source-bound"),
+    "p2wlan-linux-x64-cli.tar.gz": ("linux-cli", "x64", "rust-source-bound"),
+    "p2wlan-linux-x64.tar.gz": ("linux", "x64", "client-stamped-daemon-verified"),
+    "p2wlan-macos-arm64.dmg": ("macos", "arm64", "client-stamped-daemon-verified"),
+    "p2wlan-macos-x64.dmg": ("macos", "x64", "client-stamped-daemon-verified"),
+    "p2wlan-windows-x64-setup.exe": ("windows", "x64", "client-stamped-daemon-verified"),
+}
+PRIMARY.update({name: (*identity, "musl-static-sdk-packaged") for name, identity in OPENWRT_PRIMARY.items()})
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class ReleaseSetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for index, name in enumerate(PRIMARY, start=1):
+            (self.root / name).write_bytes((f"artifact-{index}-{name}\n").encode())
+        for name in ("p2wlan-linux-arm64-cli.tar.gz", "p2wlan-linux-x64-cli.tar.gz"):
+            (self.root / f"{name}.sha256").write_text(
+                f"{sha256(self.root / name)}  {name}\n", encoding="utf-8"
+            )
+        for name, (platform, arch, identity) in PRIMARY.items():
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(WRITE_METADATA),
+                    "--artifact",
+                    str(self.root / name),
+                    "--source-sha",
+                    SOURCE_SHA,
+                    "--tag",
+                    TAG,
+                    "--platform",
+                    platform,
+                    "--arch",
+                    arch,
+                    "--identity",
+                    identity,
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def verify(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "python3",
+                str(VERIFY),
+                "--directory",
+                str(self.root),
+                "--source-sha",
+                SOURCE_SHA,
+                "--tag",
+                TAG,
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_complete_metadata_bound_release_set_passes(self) -> None:
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        manifest = json.loads((self.root / "RELEASE-MANIFEST.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["schema_version"], 3)
+        self.assertEqual(manifest["source_sha"], SOURCE_SHA)
+        self.assertEqual(len(manifest["files"]), 20)
+        self.assertEqual(
+            manifest["files"]["p2wlan-android-arm64-release.apk"]["identity"],
+            "client-stamped",
+        )
+
+    def test_metadata_from_other_source_sha_fails(self) -> None:
+        path = self.root / "p2wlan-android-arm64-release.apk.metadata.json"
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        metadata["source_sha"] = "f" * 40
+        path.write_text(json.dumps(metadata), encoding="utf-8")
+        result = self.verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source_sha", result.stdout)
+
+    def test_artifact_tamper_after_metadata_fails(self) -> None:
+        path = self.root / "p2wlan-windows-x64-setup.exe"
+        path.write_bytes(path.read_bytes() + b"tampered")
+        result = self.verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sha256", result.stdout)
+
+    def test_missing_metadata_fails(self) -> None:
+        (self.root / "p2wlan-macos-arm64.dmg.metadata.json").unlink()
+        result = self.verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing artifact metadata", result.stdout)
+
+    def test_missing_openwrt_variant_fails(self) -> None:
+        (self.root / "p2wlan-openwrt-24.10-aarch64_cortex-a72.ipk").unlink()
+        result = self.verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing release asset: p2wlan-openwrt", result.stdout)
+
+    def test_openwrt_series_and_arch_cannot_be_relabelled(self) -> None:
+        path = self.root / "p2wlan-openwrt-25.12-aarch64_cortex-a53.apk.metadata.json"
+        original = json.loads(path.read_text())
+        for field, wrong in (("platform", "openwrt-24.10"), ("arch", "aarch64_generic")):
+            with self.subTest(field=field):
+                path.write_text(json.dumps({**original, field: wrong}))
+                result = self.verify()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{field}=", result.stdout)
+
+
+class PlatformApplicationIdentityTests(unittest.TestCase):
+    def test_android_distribution_identity_is_canonical(self) -> None:
+        gradle = (ROOT / "apps/flutter_client/android/app/build.gradle.kts").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('namespace = "com.p2wlan.client"', gradle)
+        self.assertIn('applicationId = "com.p2wlan.client"', gradle)
+        self.assertNotIn("TODO: Specify your own unique Application ID", gradle)
+
+        manifest = (ROOT / "apps/flutter_client/android/app/src/main/AndroidManifest.xml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'android:name="com.example.p2wlan_flutter_client.MainActivity"', manifest
+        )
+        self.assertIn(
+            'android:name="com.example.p2wlan_flutter_client.P2wlanVpnService"', manifest
+        )
+
+    def test_apple_distribution_identity_is_canonical(self) -> None:
+        with (ROOT / "apps/flutter_client/ios/Runner/Info.plist").open("rb") as handle:
+            ios_info = plistlib.load(handle)
+        self.assertEqual(ios_info["CFBundleIdentifier"], "com.p2wlan.client")
+        self.assertEqual(ios_info["CFBundleDisplayName"], "P2WLAN")
+
+        macos_config = (
+            ROOT / "apps/flutter_client/macos/Runner/Configs/AppInfo.xcconfig"
+        ).read_text(encoding="utf-8")
+        self.assertIn("PRODUCT_BUNDLE_IDENTIFIER = com.p2wlan.client", macos_config)
+
+    def test_linux_desktop_identity_matches_gtk_application_id(self) -> None:
+        cmake = (ROOT / "apps/flutter_client/linux/CMakeLists.txt").read_text(encoding="utf-8")
+        installer = (ROOT / "apps/flutter_client/scripts/install_room_links.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('set(APPLICATION_ID "com.p2wlan.diagnostics")', cmake)
+        self.assertIn("com.p2wlan.diagnostics.desktop", installer)
+        self.assertIn("StartupWMClass=com.p2wlan.diagnostics", installer)
+        self.assertNotIn("com.example.p2wlan_flutter_client.desktop", installer)
+
+
+if __name__ == "__main__":
+    unittest.main()

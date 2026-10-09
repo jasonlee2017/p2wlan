@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="tile" x1="82" y1="82" x2="430" y2="430" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.46" stop-color="#f8fdff"/>
+      <stop offset="1" stop-color="#f3fff6"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="142" y1="256" x2="370" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#46aeeb"/>
+      <stop offset="1" stop-color="#6ee192"/>
+    </linearGradient>
+    <filter id="softShadow" x="-18%" y="-16%" width="136%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="13" flood-color="#1f2937" flood-opacity="0.16"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" fill="none"/>
+  <rect x="62" y="62" width="388" height="388" rx="92" fill="url(#tile)" filter="url(#softShadow)"/>
+  <rect x="66" y="66" width="380" height="380" rx="88" fill="none" stroke="#e8edf0" stroke-width="3"/>
+  <path
+    d="M256 256
+       C282 166 372 188 372 256
+       C372 324 282 346 256 256
+       C230 166 140 188 140 256
+       C140 324 230 346 256 256"
+    fill="none"
+    stroke="url(#mark)"
+    stroke-width="50"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+</svg>

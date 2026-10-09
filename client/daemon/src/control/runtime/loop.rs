@@ -1,0 +1,876 @@
+#[allow(clippy::too_many_arguments)]
+async fn run_control_loop(
+    mut config: Config,
+    http: RouteAwareControlHttpClient,
+    timeline: Arc<ConnectionTimeline>,
+    event_tx: &mpsc::UnboundedSender<ControlEvent>,
+    state: Arc<RwLock<ClientState>>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<ControlCommand>,
+    config_path: Option<PathBuf>,
+    relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
+    critical_auth_tx: watch::Sender<Option<CriticalControlAuth>>,
+    health: Option<Arc<crate::tasks::HealthState>>,
+    advertised_snapshot: Arc<std::sync::Mutex<AdvertisedEndpointSnapshot>>,
+    event_loop_ready: Arc<AtomicBool>,
+    telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
+    server_clock: Arc<ServerClockEstimate>,
+    network_changes: Arc<ControlNetworkChanges>,
+) {
+    let base_url = normalize_http_base_url(&config.control.server_url);
+
+    // Prefer an existing device credential; fall back to user JWT for first registration.
+    let mut token = if !config.control.device_credential.trim().is_empty() {
+        config.control.device_credential.clone()
+    } else {
+        config.control.auth_token.clone()
+    };
+    let user_token = if !config.control.auth_token.trim().is_empty() {
+        config.control.auth_token.clone()
+    } else {
+        token.clone()
+    };
+    let signal_signing_identity = SignalSigningIdentity::from_config(&config);
+    // Bounded cache of recently processed signal IDs: a redelivered batch
+    // (lost ACK, expired lease) is deduped by signal id.
+    let recent_signal_ids: Arc<tokio::sync::Mutex<SignalDeliveryTracker>> =
+        Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default()));
+
+    info!("Connecting to control plane at {base_url}");
+
+    // Outer recovery loop: re-registers after transient disconnects.
+    'recovery: loop {
+        server_clock.invalidate_registration();
+        // The critical lane must never reuse a node id/token from a previous
+        // registration generation while this loop is reconnecting.
+        let _ = critical_auth_tx.send(None);
+        // ---- Registration with exponential backoff ----
+        let (self_node_id, registration_seq, network_edge) = {
+            let mut attempt: u32 = 0;
+            loop {
+                let (network_edge, changed) = network_changes.begin_registration();
+                if changed {
+                    http.notify_network_changed();
+                    debug!(
+                        event = "android_network_hint_absorbed",
+                        "Registration starts on the latest authorized network edge"
+                    );
+                }
+                let Some(mut registration_state) = network_changes
+                    .during_registration(
+                        &network_edge,
+                        &critical_auth_tx,
+                        &server_clock,
+                        state.write(),
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                registration_state.registered = false;
+                drop(registration_state);
+                let registration = tokio::select! {
+                    biased;
+                    _ = network_changes.changed_since(&network_edge) => {
+                        debug!(event = "control_registration_superseded", "Physical network changed during registration; discarding the old attempt");
+                        continue;
+                    }
+                    result = async {
+                        let current_http = http.current()?;
+                        register_device(&current_http, &base_url, &token, &config).await
+                    } => result,
+                };
+                if !network_changes.commit_registration_if_current(
+                    &network_edge,
+                    &critical_auth_tx,
+                    &server_clock,
+                    || {},
+                ) {
+                    continue;
+                }
+                match registration {
+                    Ok((
+                        node_id,
+                        virtual_ip,
+                        cidr,
+                        server_relay_servers,
+                        relay_catalog,
+                        registration_seq,
+                        accepted_peer_capabilities,
+                    )) => {
+                        let registration_seq_changed =
+                            config.control.registration_seq != registration_seq;
+                        if !network_changes.commit_registration_if_current(
+                            &network_edge,
+                            &critical_auth_tx,
+                            &server_clock,
+                            || {
+                                config.control.registration_seq = registration_seq;
+                                let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                                    accepted_peer_capabilities,
+                                    base_url: base_url.clone(),
+                                    token: token.clone(),
+                                    self_node_id: node_id.clone(),
+                                    registration_seq,
+                                    signal_signing_identity: signal_signing_identity.clone(),
+                                }));
+                            },
+                        ) {
+                            continue;
+                        }
+                        if let Some(health) = health.as_ref() {
+                            if network_changes
+                                .during_registration(
+                                    &network_edge,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    health.mark_device_lease_success(),
+                                )
+                                .await
+                                .is_none()
+                            {
+                                continue;
+                            }
+                        }
+                        if let Some(hub) = &telemetry_hub {
+                            hub.set_ids(node_id.clone(), config.network.network_id.clone());
+                            if let Some(seq) = registration_seq {
+                                hub.set_registration_seq(seq);
+                            }
+                        }
+                        timeline.emit(
+                            "control_registered",
+                            None,
+                            None,
+                            Some(format!("node_id={node_id} virtual_ip={virtual_ip}")),
+                        );
+                        {
+                            let Some(mut s) = network_changes
+                                .during_registration(
+                                    &network_edge,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    state.write(),
+                                )
+                                .await
+                            else {
+                                continue;
+                            };
+                            if !network_changes.commit_registration_if_current(
+                                &network_edge,
+                                &critical_auth_tx,
+                                &server_clock,
+                                || {
+                                    s.registered = true;
+                                    s.virtual_ip = Some(virtual_ip.clone());
+                                },
+                            ) {
+                                continue;
+                            }
+                        }
+                        {
+                            let mut snap = advertised_snapshot.lock().unwrap();
+                            snap.endpoint.clear();
+                            snap.nat_type = "unknown".to_string();
+                            snap.generation = None;
+                            snap.lifecycle = None;
+                            snap.observation = None;
+                        }
+                        if !server_relay_servers.is_empty() {
+                            config.relay.servers = server_relay_servers.clone();
+                        }
+                        let mut config_changed = false;
+                        if !config.network.manual {
+                            if config.network.virtual_ip != virtual_ip {
+                                config.network.virtual_ip = virtual_ip.clone();
+                                config_changed = true;
+                            }
+                            if config.network.cidr != cidr {
+                                config.network.cidr = cidr.clone();
+                                config_changed = true;
+                            }
+                        }
+                        if config_changed || registration_seq_changed {
+                            if let Some(ref path) = config_path {
+                                let mut persisted = config.clone();
+                                persisted.control.auth_token.clear();
+                                if let Err(e) = persisted.save_to_file(path) {
+                                    warn!("Failed to save control-assigned network config: {e}");
+                                }
+                            }
+                        }
+                        let relay_servers = if server_relay_servers.is_empty() {
+                            config.relay.servers.clone()
+                        } else {
+                            server_relay_servers
+                        };
+
+                        if !network_changes.commit_registration_if_current(
+                            &network_edge,
+                            &critical_auth_tx,
+                            &server_clock,
+                            || {
+                                let _ = event_tx.send(ControlEvent::Registered {
+                                    node_id: Some(node_id.clone()),
+                                    virtual_ip: virtual_ip.clone(),
+                                    cidr: Some(cidr.clone()),
+                                    relay_servers,
+                                    relay_catalog,
+                                });
+                            },
+                        ) {
+                            continue;
+                        }
+
+                        // Attempt Ed25519 challenge for device credential
+                        if !config.control.credential_issued
+                            && !config.node.ed25519_private_key.is_empty()
+                            && !config.node.ed25519_public_key.is_empty()
+                        {
+                            info!("Attempting Ed25519 challenge for device credential...");
+                            let credential_work = async {
+                                let current_http = http.current()?;
+                                obtain_device_credential(
+                                    &current_http,
+                                    &base_url,
+                                    &user_token,
+                                    &node_id,
+                                    &config.node.ed25519_private_key,
+                                    &config.node.ed25519_public_key,
+                                )
+                                .await
+                            };
+                            let credential_result = network_changes
+                                .finish_registration_side_effect(
+                                    &network_edge,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    credential_work,
+                                )
+                                .await;
+                            match credential_result {
+                                Ok(device_credential) => {
+                                    info!("Device credential obtained successfully");
+                                    config.control.device_credential = device_credential.clone();
+                                    config.control.credential_issued = true;
+                                    token = device_credential;
+                                    if let Some(ref path) = config_path {
+                                        let mut persisted = config.clone();
+                                        persisted.control.auth_token.clear();
+                                        if let Err(e) = persisted.save_to_file(path) {
+                                            warn!(
+                                                "Failed to save config with device credential: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to obtain device credential (non-fatal): {e}");
+                                }
+                            }
+                        }
+
+                        // Publish only after credential issuance has had a
+                        // chance to replace the user token.  The independent
+                        // handshake worker must sign as this exact
+                        // server-assigned node identity, never config.node_id.
+                        if !network_changes.commit_registration_if_current(
+                            &network_edge,
+                            &critical_auth_tx,
+                            &server_clock,
+                            || {
+                                let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                                    accepted_peer_capabilities,
+                                    base_url: base_url.clone(),
+                                    token: token.clone(),
+                                    self_node_id: node_id.clone(),
+                                    registration_seq,
+                                    signal_signing_identity: signal_signing_identity.clone(),
+                                }));
+                            },
+                        ) {
+                            continue;
+                        }
+
+                        break (node_id, registration_seq, network_edge);
+                    }
+                    Err(err) => {
+                        let err_str = err.to_string();
+                        if is_registration_conflict_error(&err_str) {
+                            // A persistent daemon incarnation is intentionally
+                            // not incremented in-process. Retrying this stale
+                            // request as if it were transient could let an old
+                            // process fence a newer one, so only a fresh daemon
+                            // boot may reserve a new incarnation.
+                            error!(
+                                "Control registration lifecycle conflict — restart required: {err_str}"
+                            );
+                            if let Some(health) = health.as_ref() {
+                                health.set_reauth_required(true);
+                            }
+                            let _ =
+                                event_tx.send(ControlEvent::ReauthRequired { message: err_str });
+                            let _ = event_tx.send(ControlEvent::Disconnected);
+                            return;
+                        }
+                        if is_permanent_auth_error(&err_str) {
+                            if token != user_token && !user_token.trim().is_empty() {
+                                warn!(
+                                    "Stored device credential was rejected; retrying registration with user token"
+                                );
+                                token = user_token.clone();
+                                config.control.device_credential.clear();
+                                config.control.credential_issued = false;
+                                continue;
+                            }
+                            error!(
+                                "Control registration permanent auth failure — re-authentication required: {err_str}"
+                            );
+                            let _ =
+                                event_tx.send(ControlEvent::ReauthRequired { message: err_str });
+                            if !wait_control_recovery(
+                                ControlRecoveryDelay::PermanentAuth,
+                                &http,
+                                cmd_rx,
+                                event_tx,
+                                &critical_auth_tx,
+                                &server_clock,
+                                None,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            warn!("Retrying registration after permanent-auth cooldown");
+                            // After cooldown, try again (outer attempt loop).
+                            continue;
+                        }
+
+                        attempt = attempt.saturating_add(1);
+                        let delay = backoff_delay(attempt.saturating_sub(1));
+                        warn!(
+                            "Control registration failed (attempt {attempt}); retrying in {delay:?}: {err_str}"
+                        );
+                        if !wait_control_recovery(
+                            ControlRecoveryDelay::Transient(delay),
+                            &http,
+                            cmd_rx,
+                            event_tx,
+                            &critical_auth_tx,
+                            &server_clock,
+                            None,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        // ---- Polling cycle ----
+        // Initial poll
+        let initial_peer_work = async {
+            let (current_http, http_pool_id) = http.current_with_pool_id()?;
+            poll_peers(
+                &current_http,
+                http_pool_id,
+                &base_url,
+                &token,
+                &config,
+                &self_node_id,
+                registration_seq,
+                &state,
+                event_tx,
+            )
+            .await
+        };
+        let Some(initial_peer_poll) = network_changes
+            .during_registration(
+                &network_edge,
+                &critical_auth_tx,
+                &server_clock,
+                initial_peer_work,
+            )
+            .await
+        else {
+            continue 'recovery;
+        };
+        if let Err(err) = initial_peer_poll {
+            let err_str = err.to_string();
+            if is_registration_conflict_error(&err_str) {
+                emit_registration_lifecycle_conflict(health.as_ref(), event_tx, err_str).await;
+                return;
+            }
+            warn!("Initial peer polling failed: {err_str}");
+            if let Some(health) = health.as_ref() {
+                health.set_control_connected(false);
+            }
+            let _ = event_tx.send(ControlEvent::Disconnected);
+        } else {
+            if let Some(health) = health.as_ref() {
+                health.mark_control_success().await;
+            }
+            let _ = event_tx.send(ControlEvent::ControlHealthy);
+        }
+        // Do not lease the first signal until the daemon's main consumer is
+        // ready.  A leased signal delivered during startup cannot be applied;
+        // the server's ordered lease would then fence every later signal for
+        // its full TTL, making a healthy relay handshake appear to stall.
+        if network_changes
+            .during_registration(
+                &network_edge,
+                &critical_auth_tx,
+                &server_clock,
+                wait_for_event_loop_ready(&event_loop_ready),
+            )
+            .await
+            .is_none()
+        {
+            continue 'recovery;
+        }
+        let initial_signal_poll = async {
+            let current_http = http.current()?;
+            poll_signals(
+                &current_http,
+                &base_url,
+                &token,
+                &self_node_id,
+                registration_seq,
+                event_tx,
+                0,
+                &recent_signal_ids,
+                &server_clock,
+                critical_auth_tx.subscribe(),
+                &http,
+            )
+            .await
+        }
+        .await;
+        // A GET may already have leased rows. Let decoding/application-lane
+        // setup finish, then revoke so the release owner can recover them.
+        if !network_changes.commit_registration_if_current(
+            &network_edge,
+            &critical_auth_tx,
+            &server_clock,
+            || {},
+        ) {
+            continue 'recovery;
+        }
+        if let Err(err) = initial_signal_poll {
+            let err_str = err.to_string();
+            if is_registration_conflict_error(&err_str) {
+                emit_registration_lifecycle_conflict(health.as_ref(), event_tx, err_str).await;
+                return;
+            }
+            warn!("Initial signal polling failed: {err_str}");
+            if let Some(health) = health.as_ref() {
+                health.set_control_connected(false);
+            }
+            let _ = event_tx.send(ControlEvent::Disconnected);
+        } else {
+            if let Some(health) = health.as_ref() {
+                health.mark_control_success().await;
+            }
+            let _ = event_tx.send(ControlEvent::ControlHealthy);
+        }
+
+        if !network_changes.commit_registration_if_current(
+            &network_edge,
+            &critical_auth_tx,
+            &server_clock,
+            || {},
+        ) {
+            continue 'recovery;
+        }
+        let signal_ws_connected = Arc::new(AtomicBool::new(false));
+        let (signal_wake_tx, mut signal_wake_rx) = mpsc::channel(SIGNAL_WS_WAKE_QUEUE);
+        let signal_ws_task = token.starts_with("dc-").then(|| {
+            spawn_signal_websocket(
+                &base_url,
+                &token,
+                &self_node_id,
+                &config.network.network_id,
+                registration_seq,
+                signal_wake_tx.clone(),
+                signal_ws_connected.clone(),
+                telemetry_hub.clone(),
+            )
+        });
+        let _telemetry_sender = token.starts_with("dc-").then(|| {
+            telemetry_hub.as_ref().map(|hub| {
+                let sender = Arc::new(crate::peer::PathTelemetrySender::new(
+                    hub.clone(),
+                    base_url.clone(),
+                    token.clone(),
+                ));
+                sender.spawn_worker(signal_ws_connected.clone())
+            })
+        });
+        drop(signal_wake_tx);
+
+        // Lease refresh/endpoint publication follows the configured
+        // heartbeat. Peer roster discovery is intentionally independent: it
+        // gates relay-first handshake admission and must not inherit a
+        // multi-second lease interval.
+        let heartbeat_interval_secs = config.control.heartbeat_interval_secs.max(1);
+        let mut heartbeat_tick = time::interval(Duration::from_secs(heartbeat_interval_secs));
+        heartbeat_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut peer_roster_tick =
+            time::interval(Duration::from_secs(PEER_ROSTER_POLL_INTERVAL_SECS));
+        peer_roster_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut signal_tick = time::interval(SIGNAL_FALLBACK_TICK);
+        signal_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut poll_failures: u32 = 0;
+        let mut signal_failures: u32 = 0;
+        let mut heartbeat_failures: u32 = 0;
+        loop {
+            tokio::select! {
+                _ = heartbeat_tick.tick() => {
+                    let (advertised_endpoint, advertised_nat_type) = {
+                        let snap = advertised_snapshot.lock().unwrap();
+                        (snap.endpoint.clone(), snap.nat_type.clone())
+                    };
+                    let relay_rtt_ms = current_relay_rtt_ms(relay_selection.as_ref()).await;
+                    let advertised_nat_type = control_label_with_registration_seq(
+                        &advertised_nat_type,
+                        registration_seq,
+                    );
+                    let heartbeat_result = async {
+                        let current_http = http.current()?;
+                        update_endpoint(
+                            &current_http,
+                            &base_url,
+                            &token,
+                            &self_node_id,
+                            &advertised_endpoint,
+                            &advertised_nat_type,
+                            relay_rtt_ms,
+                            registration_seq,
+                        )
+                        .await
+                    }
+                    .await;
+                    match heartbeat_result {
+                        Ok(()) => {
+                            if heartbeat_failures > 0 {
+                                info!(
+                                    "Device lease refresh recovered after {} failures",
+                                    heartbeat_failures
+                                );
+                            }
+                            heartbeat_failures = 0;
+                            if let Some(health) = health.as_ref() {
+                                health.mark_device_lease_success().await;
+                            }
+                            let _ = event_tx.send(ControlEvent::ControlHealthy);
+                        }
+                        Err(err) => {
+                            heartbeat_failures = heartbeat_failures.saturating_add(1);
+                            let err_str = err.to_string();
+                            if is_registration_conflict_error(&err_str) {
+                                emit_registration_lifecycle_conflict(health.as_ref(), event_tx, err_str).await;
+                                return;
+                            }
+                            warn!(
+                                "Device lease refresh failed (attempt {heartbeat_failures}): {err_str}"
+                            );
+                            if let Some(health) = health.as_ref() {
+                                health.set_control_api_reachable(false);
+                                health.set_device_lease_healthy(false);
+                            }
+                            let _ = event_tx.send(ControlEvent::Disconnected);
+
+                            // The server uses the endpoint PATCH as the device
+                            // lease heartbeat. Merely continuing to poll the
+                            // node list can therefore leave this process looking
+                            // healthy locally while the server marks it offline
+                            // and the relay drops its registration. Re-register
+                            // after a short bounded run of failures so the
+                            // server-issued node/session is refreshed.
+                            if is_permanent_auth_error(&err_str) || heartbeat_failures >= 3 {
+                                warn!(
+                                    "Device lease refresh failed {heartbeat_failures} times; re-registering with control plane"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ = peer_roster_tick.tick() => {
+                    let poll_result = async {
+                        let (current_http, http_pool_id) = http.current_with_pool_id()?;
+                        poll_peers(
+                            &current_http,
+                            http_pool_id,
+                            &base_url,
+                            &token,
+                            &config,
+                            &self_node_id,
+                            registration_seq,
+                            &state,
+                            event_tx,
+                        )
+                        .await
+                    }
+                    .await;
+                    match &poll_result {
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if is_registration_conflict_error(&err_str) {
+                                emit_registration_lifecycle_conflict(health.as_ref(), event_tx, err_str).await;
+                                return;
+                            }
+                            if is_permanent_auth_error(&err_str) {
+                                error!("Permanent auth failure during polling: {err_str}");
+                                if let Some(health) = health.as_ref() {
+                                    health.set_reauth_required(true);
+                                }
+                                let _ = event_tx.send(ControlEvent::ReauthRequired {
+                                    message: err_str,
+                                });
+                                if !wait_control_recovery(
+                                    ControlRecoveryDelay::PermanentAuth,
+                                    &http,
+                                    cmd_rx,
+                                    event_tx,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    signal_ws_task.as_ref(),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                break;
+                            }
+                            poll_failures = poll_failures.saturating_add(1);
+                            let delay = backoff_delay(poll_failures.saturating_sub(1));
+                            warn!("Polling failed (attempt {poll_failures}); retrying in {delay:?}: {err_str}");
+                            if let Some(health) = health.as_ref() {
+                                health.set_control_connected(false);
+                            }
+                            let _ = event_tx.send(ControlEvent::Disconnected);
+                            // After several consecutive failures, force a full re-register
+                            // so device session and peer map are refreshed after control restart.
+                            if poll_failures >= 3 {
+                                warn!("Polling failed {poll_failures} times; re-registering with control plane");
+                                break;
+                            }
+                            tokio::time::sleep(delay).await;
+                        }
+                        Ok(_) => {
+                            if poll_failures > 0 {
+                                info!("Polling recovered after {poll_failures} failures");
+                                let vip = state.read().await.virtual_ip.clone().unwrap_or_default();
+                                let _ = event_tx.send(ControlEvent::ControlRecovered {
+                                    node_id: Some(self_node_id.clone()),
+                                    virtual_ip: vip,
+                                    cidr: None,
+                                });
+                            }
+                            poll_failures = 0;
+                            if let Some(health) = health.as_ref() {
+                                health.mark_control_success().await;
+                            }
+                            let _ = event_tx.send(ControlEvent::ControlHealthy);
+                        }
+                    }
+                }
+                Some(()) = signal_wake_rx.recv() => {
+                    let signal_result = async {
+                        let current_http = http.current()?;
+                        poll_signals(
+                            &current_http,
+                            &base_url,
+                            &token,
+                            &self_node_id,
+                            registration_seq,
+                            event_tx,
+                            0,
+                            &recent_signal_ids,
+                            &server_clock,
+                            critical_auth_tx.subscribe(),
+                            &http,
+                        )
+                        .await
+                    }
+                    .await;
+                    match signal_result {
+                        Ok(()) => {
+                            signal_failures = 0;
+                            if let Some(health) = health.as_ref() {
+                                health.mark_control_success().await;
+                            }
+                            let _ = event_tx.send(ControlEvent::ControlHealthy);
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if is_registration_conflict_error(&err_str) {
+                                emit_registration_lifecycle_conflict(health.as_ref(), event_tx, err_str).await;
+                                return;
+                            }
+                            if is_permanent_auth_error(&err_str) {
+                                error!("Permanent auth failure after WebSocket signal wake: {err_str}");
+                                if let Some(health) = health.as_ref() {
+                                    health.set_reauth_required(true);
+                                }
+                                let _ = event_tx.send(ControlEvent::ReauthRequired {
+                                    message: err_str,
+                                });
+                                break;
+                            }
+                            signal_failures = signal_failures.saturating_add(1);
+                            warn!("Signal fetch after WebSocket wake failed: {err_str}");
+                            if let Some(health) = health.as_ref() {
+                                health.set_control_connected(false);
+                            }
+                            let _ = event_tx.send(ControlEvent::Disconnected);
+                        }
+                    }
+                }
+                _ = signal_tick.tick() => {
+                    let ws_connected = signal_ws_connected.load(Ordering::Acquire);
+                    // A WebSocket notification is only a latency hint.  Keep
+                    // polling the durable REST queue even when it is
+                    // connected; a legacy/partially deployed server can
+                    // accept WS connections but fail to emit a wake-up for a
+                    // successfully queued signal.
+                    let wait_ms = signal_poll_wait_ms(ws_connected);
+                    let signal_result = async {
+                        let current_http = http.current()?;
+                        poll_signals(
+                            &current_http,
+                            &base_url,
+                            &token,
+                            &self_node_id,
+                            registration_seq,
+                            event_tx,
+                            wait_ms,
+                            &recent_signal_ids,
+                            &server_clock,
+                            critical_auth_tx.subscribe(),
+                            &http,
+                        )
+                        .await
+                    }
+                    .await;
+                    match signal_result {
+                        Ok(()) => {
+                            signal_failures = 0;
+                            if let Some(health) = health.as_ref() {
+                                health.mark_control_success().await;
+                            }
+                            let _ = event_tx.send(ControlEvent::ControlHealthy);
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if is_registration_conflict_error(&err_str) {
+                                emit_registration_lifecycle_conflict(health.as_ref(), event_tx, err_str).await;
+                                return;
+                            }
+                            if is_permanent_auth_error(&err_str) {
+                                error!("Permanent auth failure during signal polling: {err_str}");
+                                if let Some(health) = health.as_ref() {
+                                    health.set_reauth_required(true);
+                                }
+                                let _ = event_tx.send(ControlEvent::ReauthRequired {
+                                    message: err_str,
+                                });
+                                if !wait_control_recovery(
+                                    ControlRecoveryDelay::PermanentAuth,
+                                    &http,
+                                    cmd_rx,
+                                    event_tx,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    signal_ws_task.as_ref(),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                break;
+                            }
+
+                            signal_failures = signal_failures.saturating_add(1);
+                            warn!(
+                                "Signal polling failed (attempt {signal_failures}); continuing: {err_str}"
+                            );
+                            if let Some(health) = health.as_ref() {
+                                health.set_control_connected(false);
+                            }
+                            let _ = event_tx.send(ControlEvent::Disconnected);
+                            if signal_failures >= 3 {
+                                warn!("Signal polling failed {signal_failures} times; re-registering with control plane");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Some(cmd) = cmd_rx.recv() => {
+                    match handle_control_command(
+                        cmd,
+                        &http,
+                        &base_url,
+                        &token,
+                        &config,
+                        &self_node_id,
+                        registration_seq,
+                        &state,
+                        event_tx,
+                        health.as_ref(),
+                        relay_selection.as_ref(),
+                        &advertised_snapshot,
+                        &mut peer_roster_tick,
+                        signal_ws_task.as_ref(),
+                        &mut poll_failures,
+                    )
+                    .await
+                    {
+                        ControlCommandDisposition::Continue => {}
+                        ControlCommandDisposition::Reregister => break,
+                        ControlCommandDisposition::Exit => return,
+                    }
+                }
+                else => {
+                    // Command channel closed — exit.
+                    if let Some(health) = health.as_ref() {
+                        health.set_control_api_reachable(false);
+                        health.set_device_lease_healthy(false);
+                    }
+                    let _ = event_tx.send(ControlEvent::Disconnected);
+                    return;
+                }
+            }
+        }
+
+        drop(signal_ws_task);
+
+        // Reached here by breaking the poll loop (auth failure or consecutive poll failures).
+        // Mark unregistered so peers are refreshed on next successful register/poll.
+        let _ = critical_auth_tx.send(None);
+        {
+            let mut s = state.write().await;
+            s.registered = false;
+        }
+        if let Some(health) = health.as_ref() {
+            health.set_control_api_reachable(false);
+            health.set_device_lease_healthy(false);
+        }
+        let _ = event_tx.send(ControlEvent::Disconnected);
+        info!("Re-entering control registration cycle");
+        // brief pause before re-register to avoid hammering a restarting server
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    } // end outer loop — will hit the `return` inside on Shutdown, or loop around
+}
+
+/// Wait for `Daemon::run` to install its control-event consumer.  Do not read
+/// the command channel here: commands can carry response senders and must
+/// remain queued for the normal polling loop rather than being consumed and
+/// dropped while startup is still in progress.
+async fn wait_for_event_loop_ready(ready: &Arc<AtomicBool>) {
+    while !ready.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}

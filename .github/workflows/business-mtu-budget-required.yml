@@ -1,0 +1,254 @@
+name: Business MTU Budget Required
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/business-mtu-budget-required.yml"
+      - ".github/workflows/dplpmtud-required.yml"
+      - "client/daemon/**"
+      - "client/netbind/**"
+      - "client/tun/**"
+      - "client/wireguard/**"
+      - "client/relay/**"
+      - "scripts/dplpmtud/**"
+      - "contracts/dplpmtud_acceptance.json"
+      - "docs/reference/networking.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/business-mtu-budget-required.yml"
+      - ".github/workflows/dplpmtud-required.yml"
+      - "client/daemon/**"
+      - "client/netbind/**"
+      - "client/tun/**"
+      - "client/wireguard/**"
+      - "client/relay/**"
+      - "scripts/dplpmtud/**"
+      - "contracts/dplpmtud_acceptance.json"
+      - "docs/reference/networking.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      validation_sha:
+        description: "Exact source SHA to validate"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: read
+  actions: read
+
+concurrency:
+  # A commit validation (push / pull_request) and a periodic health check
+  # (schedule / workflow_dispatch) are different obligations for the same
+  # ref. Sharing one concurrency group let a scheduled run cancel an
+  # in-flight commit validation, so each event class gets its own group and
+  # only a pull request cancels its own superseded predecessors.
+  group: business-mtu-budget-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.validation_sha || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  P2WLAN_VALIDATION_SHA: ${{ github.event.pull_request.head.sha || inputs.validation_sha || github.sha }}
+
+jobs:
+  linux_validation:
+    name: Business MTU Linux validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_VALIDATION_SHA }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_VALIDATION_SHA"
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux workspace dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+
+      - name: Cargo format
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Cargo workspace tests
+        env:
+          RUST_TEST_THREADS: "1"
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-features -- --test-threads=1 --skip hard_hard_ 2>&1 | tee /tmp/workspace-tests.log
+          ! grep -qE '0 tests, [1-9][0-9]* benchmarks' /tmp/workspace-tests.log
+
+      - name: Hard-hard E2E tests
+        run: cargo test -p p2wlan-daemon --lib hard_hard_ -- --test-threads=1
+
+      - name: WireGuard sizing and inbound-control regression
+        run: cargo test -p p2wlan-daemon --lib transport::tests -- --test-threads=1
+
+      - name: IPv4 and IPv6 local-feedback regressions
+        run: cargo test -p p2wlan-daemon --lib business_mtu::tests -- --test-threads=1
+
+  production_e2e:
+    name: Business MTU production path ${{ matrix.replica }}/5
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_VALIDATION_SHA }}
+          fetch-depth: 1
+
+      - name: Verify exact production-path source head
+        shell: bash
+        env:
+          BUSINESS_MTU_REPLICA: ${{ matrix.replica }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$P2WLAN_VALIDATION_SHA"
+          echo "business_mtu_source_head=$actual replica=$BUSINESS_MTU_REPLICA/5"
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Run exact production dataplane regression
+        env:
+          P2WLAN_BUSINESS_MTU_REPLICA: ${{ matrix.replica }}
+        run: |
+          set -o pipefail
+          cargo test -p p2wlan-daemon --lib tests::direct_business_budget_production_path_e2e -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/business-mtu-e2e-${P2WLAN_BUSINESS_MTU_REPLICA}.log"
+          grep -q 'BUSINESS_BUDGET_E2E .*udp=1200 .*overlay=1168 .*pending_fifo=true .*oversize_zero_send=true .*ciphertext_zero_send=true .*revoke_race_zero_send=true .*path_race_zero_send=true .*emsgsize_recovery=true .*direct_active=true .*direct_health_failure_count=0 .*relay_fallback_count=0 .*task_leak=false' "$RUNNER_TEMP/business-mtu-e2e-${P2WLAN_BUSINESS_MTU_REPLICA}.log"
+
+      - name: Upload production-path evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: business-mtu-e2e-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.replica }}-of-5
+          path: ${{ runner.temp }}/business-mtu-e2e-${{ matrix.replica }}.log
+          if-no-files-found: error
+          retention-days: 14
+
+  windows_validation:
+    name: Business MTU Windows validation
+    runs-on: windows-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_VALIDATION_SHA }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne $env:P2WLAN_VALIDATION_SHA) {
+            throw "exact source checkout mismatch"
+          }
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      - name: Windows compile
+        run: cargo check -p p2wlan-daemon --all-targets --all-features
+
+      - name: Windows business-budget production test
+        run: cargo test -p p2wlan-daemon --lib tests::direct_business_budget_production_path_e2e -- --exact --test-threads=1
+
+      - name: Windows local-feedback and token-race tests
+        shell: pwsh
+        run: |
+          python scripts/quality/run_rust_tests.py tests::direct_business_ipv6_budget_floor_is_fail_closed_without_invalid_ptb --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/quality/run_rust_tests.py tests::direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/quality/run_rust_tests.py dplpmtud::runtime::tests::business_publication_is_explicit_revisioned_and_registry_independent --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/quality/run_rust_tests.py dplpmtud::runtime::tests::old_business_tokens_fail_after_raise_drop_and_path_replacement --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  existing_required_gates:
+    name: Business MTU external required gates
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require same-head repository gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Untrusted event data must reach the shell through a validated env
+          # value, never by direct interpolation.
+          P2WLAN_GATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 scripts/quality/check_required_gates.py \
+            --sha "$P2WLAN_GATE_HEAD_SHA" \
+            --require "Path State Machine Required" \
+            --require "NAT Topology Required" \
+            --require "Windows Lifecycle Required" \
+            --require "Mobile Lifecycle Required" \
+            --require "CI Required" \
+            --require "OpenWrt Packages Required" \
+            --require "Analyze and Test" \
+            --require "Android arm64 CI test APK" \
+            --require "iOS Compile" \
+            --require "Linux x64 Release Bundle" \
+            --require "macOS Release Apps" \
+            --require "Windows x64 Release Bundle" \
+            --require "macOS arm64 test DMG" \
+            --require "Android arm64 test APK" \
+            --timeout-seconds 3900
+  required:
+    name: Business MTU Budget Required
+    if: always()
+    needs:
+      - linux_validation
+      - production_e2e
+      - windows_validation
+      - existing_required_gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce aggregate results
+        env:
+          LINUX_RESULT: ${{ needs.linux_validation.result }}
+          E2E_RESULT: ${{ needs.production_e2e.result }}
+          WINDOWS_RESULT: ${{ needs.windows_validation.result }}
+          EXTERNAL_RESULT: ${{ needs.existing_required_gates.result }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          test "$LINUX_RESULT" = "success"
+          test "$E2E_RESULT" = "success"
+          test "$WINDOWS_RESULT" = "success"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            test "$EXTERNAL_RESULT" = "success"
+          else
+            test "$EXTERNAL_RESULT" = "skipped"
+          fi

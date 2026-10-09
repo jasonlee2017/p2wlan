@@ -1,0 +1,923 @@
+use std::net::Ipv4Addr;
+use std::time::Duration;
+
+use p2pnet_crypto::NodeIdentity;
+use p2pnet_nat::build_authenticated_punch_ack;
+use p2pnet_nat::build_authenticated_punch_packet;
+use p2pnet_tun::{Ipv4Packet, MockTunDevice};
+use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+
+use super::*;
+use crate::config::Config;
+use crate::control::PeerInfo;
+use crate::dataplane::DataPlane;
+use crate::peer::{ConnectionState, ProbeBindingStage, ProbeKeyRole};
+use crate::transport::WireGuardTransport;
+
+fn peer(node_id: &str, virtual_ip: &str, endpoint: Option<SocketAddr>) -> PeerInfo {
+    PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
+        node_id: node_id.to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: "pk".to_string(),
+        endpoint: endpoint.map(|addr| addr.to_string()).unwrap_or_default(),
+        nat_type: "FullCone".to_string(),
+        virtual_ip: virtual_ip.to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    }
+}
+
+fn peer_with_public_key(
+    node_id: &str,
+    virtual_ip: &str,
+    public_key: String,
+    endpoint: Option<SocketAddr>,
+) -> PeerInfo {
+    PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
+        node_id: node_id.to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key,
+        endpoint: endpoint.map(|addr| addr.to_string()).unwrap_or_default(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: virtual_ip.to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    }
+}
+
+fn peer_manager() -> Arc<PeerManager> {
+    // Socket ownership and heartbeat tests seed already-active Relay state.
+    // Their legacy Auto fixture is independent of DirectFirst admission tests.
+    let mut config = Config::generate_default("http://ctrl.test", "default").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::Auto;
+    Arc::new(PeerManager::new(config))
+}
+
+fn config_for_identity(identity: &NodeIdentity, node_id: &str) -> Config {
+    let mut config = Config::generate_default("http://ctrl.test", "default").unwrap();
+    config.node.node_id = node_id.to_string();
+    config.node.public_key = hex::encode(identity.public_key());
+    config.node.private_key = hex::encode(identity.private_key());
+    config
+}
+
+async fn drain_udp_quiet(socket: &UdpSocket, quiet: Duration) {
+    let mut buf = [0u8; 512];
+    while timeout(quiet, socket.recv_from(&mut buf)).await.is_ok() {}
+}
+
+#[test]
+fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
+    let pending = PendingProbe {
+        validation_preflight: None,
+        sent_at: Instant::now(),
+        expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
+        endpoint: "203.0.113.10:40000".parse().unwrap(),
+        local_endpoint: None,
+        socket_index: 2,
+        generation: 7,
+        remote_candidate_epoch: 0,
+        probe_session_id: None,
+        peer_id: Some("peer-b".to_string()),
+        purpose: PendingProbePurpose::ConnectivityCheck,
+        accepts_authenticated_ack: true,
+        accepts_legacy_ack: true,
+        socket_epoch: 0,
+        cleanup_epoch: 0,
+        direct_commit_seq: 0,
+    };
+
+    assert!(legacy_ack_matches_pending(
+        &pending,
+        "203.0.113.10:40123".parse().unwrap(),
+        7,
+        0,
+        2,
+        0,
+        0,
+    ));
+    assert!(!legacy_ack_matches_pending(
+        &pending,
+        "203.0.113.11:40123".parse().unwrap(),
+        7,
+        0,
+        2,
+        0,
+        0,
+    ));
+    assert!(!legacy_ack_matches_pending(
+        &pending,
+        "203.0.113.10:40123".parse().unwrap(),
+        8,
+        0,
+        2,
+        0,
+        0,
+    ));
+    assert!(!legacy_ack_matches_pending(
+        &pending,
+        "203.0.113.10:40123".parse().unwrap(),
+        7,
+        1,
+        2,
+        0,
+        0,
+    ));
+    assert!(!legacy_ack_matches_pending(
+        &pending,
+        "203.0.113.10:40123".parse().unwrap(),
+        7,
+        0,
+        2,
+        1,
+        0,
+    ));
+    assert!(
+        !legacy_ack_matches_pending(
+            &pending,
+            "203.0.113.10:40123".parse().unwrap(),
+            7,
+            0,
+            2,
+            0,
+            1,
+        ),
+        "a pending probe from before a Direct/candidate commit must not match after the commit sequence advances"
+    );
+}
+
+#[test]
+fn probe_rx_snapshot_delta_is_saturating() {
+    let newer = UdpProbeRxSnapshot {
+        known_peer_ip_datagrams_received: 12,
+        authenticated_probe_packets_received: 10,
+        authenticated_probe_acks_observed: 5,
+        authenticated_probe_acks_unmatched: 2,
+        legacy_probe_acks_observed: 4,
+        legacy_probe_acks_unmatched: 1,
+        probe_acks_received: 3,
+        ..UdpProbeRxSnapshot::default()
+    };
+    let older = UdpProbeRxSnapshot {
+        known_peer_ip_datagrams_received: 9,
+        authenticated_probe_packets_received: 7,
+        authenticated_probe_acks_observed: 9,
+        authenticated_probe_acks_unmatched: 1,
+        legacy_probe_acks_observed: 2,
+        legacy_probe_acks_unmatched: 5,
+        probe_acks_received: 9,
+        ..UdpProbeRxSnapshot::default()
+    };
+
+    assert_eq!(
+        newer.delta_since(older),
+        UdpProbeRxSnapshot {
+            known_peer_ip_datagrams_received: 3,
+            authenticated_probe_packets_received: 3,
+            authenticated_probe_acks_observed: 0,
+            authenticated_probe_acks_unmatched: 1,
+            legacy_probe_acks_observed: 2,
+            legacy_probe_acks_unmatched: 0,
+            probe_acks_received: 0,
+            ..UdpProbeRxSnapshot::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn peer_probe_rx_snapshot_does_not_cross_peer_or_generation() {
+    let peers = peer_manager();
+    peers.add_peer(&peer("peer-a", "10.20.0.2", None)).await;
+    assert!(
+        peers
+            .set_probe_session_id("peer-a", Some("session-current".to_string()))
+            .await
+    );
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+
+    transport
+        .update_peer_probe_rx_diagnostics("peer-a", 7, Some("session-current"), |snapshot| {
+            snapshot.authenticated_probe_acks_observed = 1;
+            snapshot.probe_acks_received = 1;
+        })
+        .await;
+    transport
+        .update_peer_probe_rx_diagnostics("peer-a", 7, Some("session-old"), |snapshot| {
+            snapshot.authenticated_probe_acks_observed = 12;
+            snapshot.probe_acks_received = 12;
+        })
+        .await;
+    transport
+        .update_peer_probe_rx_diagnostics("peer-b", 7, None, |snapshot| {
+            snapshot.authenticated_probe_acks_observed = 9;
+            snapshot.probe_acks_received = 9;
+        })
+        .await;
+    transport
+        .update_peer_probe_rx_diagnostics("peer-a", 8, Some("session-current"), |snapshot| {
+            snapshot.authenticated_probe_acks_observed = 4;
+        })
+        .await;
+
+    let peer_a = transport.probe_rx_snapshot_for_peer("peer-a", 7).await;
+    assert_eq!(peer_a.authenticated_probe_acks_observed, 1);
+    assert_eq!(peer_a.probe_acks_received, 1);
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer("peer-b", 7)
+            .await
+            .probe_acks_received,
+        9
+    );
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer("peer-a", 8)
+            .await
+            .authenticated_probe_acks_observed,
+        4
+    );
+
+    // A punch that started under session-current keeps its own receive
+    // evidence when a control-plane rekey installs session-new.  Reading the
+    // current binding here would otherwise make its timeout delta compare
+    // different sessions.
+    assert!(
+        peers
+            .set_probe_session_id("peer-a", Some("session-new".to_string()))
+            .await
+    );
+    assert_eq!(
+        transport.probe_rx_snapshot_for_peer("peer-a", 7).await,
+        UdpProbeRxSnapshot::default(),
+        "the new current session must not inherit old-session ACK evidence"
+    );
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer_session("peer-a", 7, Some("session-current"))
+            .await
+            .probe_acks_received,
+        1,
+        "an already-admitted punch must retain its original session attribution"
+    );
+}
+
+#[test]
+fn remote_scatter_punch_deadline_keeps_wide_sweep_bounded() {
+    let candidates: Vec<SocketAddr> = (0..831)
+        .map(|i| {
+            format!("203.0.113.10:{}", 40_000 + (i % 1000) as u16)
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    let deadline = estimate_remote_scatter_punch_deadline(
+        &candidates,
+        Duration::from_millis(200),
+        6,
+        3,
+        Duration::from_secs(2),
+    );
+    assert!(
+        deadline >= Duration::from_secs(10),
+        "an 831-candidate remote scatter sweep must retain a complete bounded window, got {deadline:?}"
+    );
+    assert!(
+        deadline <= Duration::from_secs(10),
+        "a Direct recovery session must not retain the old long floor, got {deadline:?}"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_punch_admission_detects_replay_and_rate_limits() {
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
+        .await
+        .unwrap();
+    let source: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    let nonce = [7u8; 8];
+
+    assert_eq!(
+        transport
+            .admit_authenticated_punch("peer-b", 1, PunchPacketKind::Punch, nonce, source)
+            .await,
+        AuthenticatedPunchAdmission::Accepted
+    );
+    assert_eq!(
+        transport
+            .admit_authenticated_punch("peer-b", 1, PunchPacketKind::Punch, nonce, source)
+            .await,
+        AuthenticatedPunchAdmission::Replay
+    );
+
+    let rate_source: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+    for index in 0..AUTH_PUNCH_RATE_LIMIT_PER_SOURCE {
+        let mut nonce = [0u8; 8];
+        nonce[0] = index as u8;
+        assert_eq!(
+            transport
+                .admit_authenticated_punch("peer-b", 2, PunchPacketKind::Punch, nonce, rate_source)
+                .await,
+            AuthenticatedPunchAdmission::Accepted
+        );
+    }
+    assert_eq!(
+        transport
+            .admit_authenticated_punch("peer-b", 2, PunchPacketKind::Punch, [99u8; 8], rate_source)
+            .await,
+        AuthenticatedPunchAdmission::RateLimited
+    );
+}
+
+#[tokio::test]
+async fn inbound_counts_known_peer_ip_and_unmatched_authenticated_ack() {
+    let local_identity = NodeIdentity::generate();
+    let peer_identity = NodeIdentity::generate();
+    let unrelated_peer_identity = NodeIdentity::generate();
+    let known_candidate: SocketAddr = "127.0.0.1:50999".parse().unwrap();
+
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-b",
+            "10.20.0.2",
+            hex::encode(peer_identity.public_key()),
+            Some(known_candidate),
+        ))
+        .await;
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-c",
+            "10.20.0.3",
+            hex::encode(unrelated_peer_identity.public_key()),
+            None,
+        ))
+        .await;
+    assert!(
+        peers
+            .has_known_public_candidate_ip("127.0.0.1".parse().unwrap())
+            .await
+    );
+    assert!(
+        !peers
+            .has_known_public_candidate_ip("198.51.100.9".parse().unwrap())
+            .await
+    );
+
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a");
+    let local_addr = transport.local_addr().unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let key = peers.probe_key_for_peer("peer-b").await.unwrap();
+    let generation = peers.current_network_generation().await;
+
+    // The frame carries peer-b's generation, which deliberately differs from
+    // peer-a's local punch generation. Its diagnostics must still land under
+    // peer-a/generation, and cannot be presented as evidence for peer-c.
+    let ack = build_authenticated_punch_ack([42u8; 8], "peer-b", "peer-a", generation + 41, &key);
+    sender.send_to(&ack, local_addr).await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if transport.socket_pool_diagnostics().await[0].authenticated_probe_acks_unmatched >= 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let diagnostics = transport.socket_pool_diagnostics().await;
+    assert_eq!(diagnostics[0].known_peer_ip_datagrams_received, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_packets_received, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_acks_observed, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_acks_unmatched, 1);
+    assert_eq!(diagnostics[0].probe_acks_received, 0);
+    let peer_b_snapshot = transport
+        .probe_rx_snapshot_for_peer("peer-b", generation)
+        .await;
+    assert_eq!(peer_b_snapshot.known_peer_ip_datagrams_received, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_packets_received, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_acks_observed, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_acks_unmatched, 1);
+    assert_eq!(peer_b_snapshot.probe_acks_received, 0);
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer("peer-c", generation)
+            .await,
+        UdpProbeRxSnapshot::default(),
+        "an ACK authenticated for peer-b must never advance peer-c's timeout evidence"
+    );
+
+    // An invalid-MAC authenticated probe from the same known peer IP is counted
+    // at the raw-IP and Probe v2 framing layers, then fails MAC validation.
+    let (mut bad_probe, _nonce) =
+        build_authenticated_punch_packet("peer-b", "peer-a", generation, &key);
+    *bad_probe.last_mut().unwrap() ^= 0x01;
+    sender.send_to(&bad_probe, local_addr).await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if transport.socket_pool_diagnostics().await[0].authenticated_probe_invalid_mac >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let diagnostics = transport.socket_pool_diagnostics().await;
+    assert_eq!(diagnostics[0].known_peer_ip_datagrams_received, 2);
+    assert_eq!(diagnostics[0].authenticated_probe_packets_received, 2);
+    assert_eq!(diagnostics[0].authenticated_probe_invalid_mac, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_acks_observed, 1);
+    assert_eq!(diagnostics[0].authenticated_probe_acks_unmatched, 1);
+    assert_eq!(diagnostics[0].probe_acks_received, 0);
+
+    worker.abort();
+}
+
+#[tokio::test]
+async fn matched_authenticated_ack_is_scoped_to_its_peer_and_enqueues_validation_only() {
+    let local_identity = NodeIdentity::generate();
+    let peer_b_identity = NodeIdentity::generate();
+    let peer_c_identity = NodeIdentity::generate();
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-b",
+            "10.20.0.2",
+            hex::encode(peer_b_identity.public_key()),
+            None,
+        ))
+        .await;
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-c",
+            "10.20.0.3",
+            hex::encode(peer_c_identity.public_key()),
+            None,
+        ))
+        .await;
+    assert!(
+        peers
+            .set_probe_session_id("peer-b", Some("session-current".to_string()))
+            .await
+    );
+
+    let validation_observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_by_trigger = validation_observations.clone();
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a")
+        .with_validation_trigger(Arc::new(move |observation| {
+            observed_by_trigger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((observation.peer_id, observation.observed_endpoint));
+        }));
+    let local_addr = transport.local_addr().unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender_addr = sender.local_addr().unwrap();
+    let generation = peers.current_network_generation().await;
+    let nonce = transport
+        .send_probe(Some("peer-b"), sender_addr)
+        .await
+        .unwrap();
+    let mut sent_probe = [0u8; 512];
+    timeout(Duration::from_secs(1), sender.recv_from(&mut sent_probe))
+        .await
+        .unwrap()
+        .unwrap();
+    let key = peers.probe_key_for_peer("peer-b").await.unwrap();
+    let ack = build_authenticated_punch_ack(nonce, "peer-b", "peer-a", generation + 17, &key);
+    sender.send_to(&ack, local_addr).await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if validation_observations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        validation_observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_slice(),
+        &[("peer-b".to_string(), sender_addr)],
+        "a matched peer-b ACK must enqueue validation for peer-b only"
+    );
+    let peer_b_snapshot = transport
+        .probe_rx_snapshot_for_peer("peer-b", generation)
+        .await;
+    assert_eq!(peer_b_snapshot.authenticated_probe_packets_received, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_acks_observed, 1);
+    assert_eq!(peer_b_snapshot.authenticated_probe_acks_unmatched, 0);
+    assert_eq!(peer_b_snapshot.probe_acks_received, 1);
+    assert_eq!(
+        transport
+            .probe_rx_snapshot_for_peer("peer-c", generation)
+            .await,
+        UdpProbeRxSnapshot::default(),
+        "peer-b's matched ACK must not modify peer-c diagnostics"
+    );
+    let diagnostics = peers.diagnostics().await;
+    let peer_b_diagnostics = diagnostics
+        .iter()
+        .find(|diagnostics| diagnostics.node_id == "peer-b")
+        .expect("peer-b diagnostics must remain available");
+    let ingress = peer_b_diagnostics
+        .direct_events
+        .iter()
+        .find(|event| event.stage == "direct_validation_ingress_requested")
+        .expect("a matched peer-b ACK must leave an attributed validation ingress event");
+    assert_eq!(ingress.network_generation, generation);
+    let sender_addr_text = sender_addr.to_string();
+    assert_eq!(ingress.endpoint.as_deref(), Some(sender_addr_text.as_str()));
+    assert_eq!(ingress.socket_index, Some(0));
+    assert!(
+        ingress.detail.contains("probe_session_id=session-current")
+            && ingress.detail.contains("socket_index=0"),
+        "the validation ingress event must retain the pending session and receiving socket: {}",
+        ingress.detail
+    );
+    let peer_c_diagnostics = diagnostics
+        .iter()
+        .find(|diagnostics| diagnostics.node_id == "peer-c")
+        .expect("peer-c diagnostics must remain available");
+    assert!(
+        !peer_c_diagnostics
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "direct_validation_ingress_requested"),
+        "peer-b's ACK must not create a validation ingress event for peer-c"
+    );
+    assert!(
+        !peers.is_direct("peer-b").await,
+        "a probe ACK is evidence for encrypted validation, never a Direct promotion"
+    );
+    assert!(
+        !transport.has_direct_validation_expectation("peer-b").await,
+        "the ACK callback alone must not manufacture a validation ACK expectation"
+    );
+
+    worker.abort();
+}
+
+fn hard_nat_candidate_report(
+    filtering_behavior: p2pnet_nat::FilteringBehavior,
+) -> CandidateGatherReport {
+    CandidateGatherReport {
+        candidates: Vec::new(),
+        nat_profile: p2pnet_nat::NatProfile {
+            local_addr: "0.0.0.0:0".to_string(),
+            observations: Vec::new(),
+            udp_blocked: false,
+            public_endpoint: Some("203.0.113.10:40000".to_string()),
+            public_ip_stable: Some(true),
+            public_port_stable: Some(false),
+            port_preserved: Some(false),
+            port_delta: Some(1),
+            likely_symmetric: Some(true),
+            mapping_behavior: MappingBehavior::AddressOrPortDependent,
+            filtering_behavior,
+            hairpin_behavior: p2pnet_nat::HairpinBehavior::Unknown,
+            mapping_lifetime: p2pnet_nat::MappingLifetime::Unknown,
+            prediction_candidate: true,
+            predicted_endpoints: vec!["203.0.113.10:40001".to_string()],
+            birthday_candidate: true,
+            confidence: 90,
+        },
+    }
+}
+
+#[test]
+fn socket_pool_activates_for_mapping_dependent_nat_with_unknown_filtering() {
+    let report = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+
+    assert!(socket_pool_is_eligible(&report));
+}
+
+#[test]
+fn socket_pool_rejects_udp_blocked_nat_profile() {
+    let mut report = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::UdpBlocked);
+    report.nat_profile.udp_blocked = true;
+
+    assert!(!socket_pool_is_eligible(&report));
+}
+
+#[test]
+fn pool_stun_evidence_promotes_a_primary_blocked_profile_before_pool_gate() {
+    let mut primary = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::UdpBlocked);
+    primary.nat_profile.udp_blocked = true;
+    primary.nat_profile.public_endpoint = None;
+    primary.nat_profile.mapping_behavior = MappingBehavior::UdpBlocked;
+    primary.nat_profile.likely_symmetric = None;
+    primary.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        server: "198.51.100.1:3478".to_string(),
+        mapped_address: None,
+        rtt_ms: None,
+        error: Some("primary timeout".to_string()),
+    }];
+
+    let mut pool = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+    pool.candidates = vec![p2pnet_nat::IceCandidate::server_reflexive(
+        "198.51.100.20",
+        41000,
+    )];
+    pool.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        server: "198.51.100.2:3478".to_string(),
+        mapped_address: Some("198.51.100.20:41000".to_string()),
+        rtt_ms: Some(8),
+        error: None,
+    }];
+
+    assert!(merge_pool_nat_profile(&mut primary, &pool));
+    assert!(!primary.nat_profile.udp_blocked);
+    assert_eq!(
+        primary.nat_profile.mapping_behavior,
+        MappingBehavior::AddressOrPortDependent
+    );
+    assert_eq!(
+        primary.nat_profile.public_endpoint.as_deref(),
+        Some("198.51.100.20:41000")
+    );
+    assert!(primary.nat_profile.birthday_candidate);
+    // The profile's observation sequence belongs to its primary local_addr.
+    // The pool-backed public candidate is retained separately and must not
+    // become a fake second port-allocation sample on that primary socket.
+    assert_eq!(primary.nat_profile.observations.len(), 1);
+    assert!(socket_pool_is_eligible(&primary));
+}
+
+#[test]
+fn pool_socket_samples_do_not_change_primary_allocation_model() {
+    let mut primary = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+    primary.nat_profile.observations = [40001, 40005, 40009]
+        .into_iter()
+        .enumerate()
+        .map(|(index, port)| p2pnet_nat::StunObservation {
+            server: format!("198.51.100.{}:3478", index + 1),
+            mapped_address: Some(format!("203.0.113.10:{port}")),
+            rtt_ms: Some(8),
+            error: None,
+        })
+        .collect();
+    let expected = p2pnet_nat::NatCapabilities::from_profile(&primary.nat_profile);
+    let mut pool = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+    pool.candidates = vec![p2pnet_nat::IceCandidate::server_reflexive(
+        "203.0.113.10",
+        52017,
+    )];
+    pool.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        server: "198.51.100.9:3478".to_string(),
+        mapped_address: Some("203.0.113.10:52017".to_string()),
+        rtt_ms: Some(12),
+        error: None,
+    }];
+
+    assert!(!merge_pool_nat_profile(&mut primary, &pool));
+    assert_eq!(primary.nat_profile.observations.len(), 3);
+    assert_eq!(
+        p2pnet_nat::NatCapabilities::from_profile(&primary.nat_profile).allocation_model,
+        expected.allocation_model
+    );
+}
+
+#[tokio::test]
+async fn global_outbound_probe_budget_limits_across_transports() {
+    let global_budget = Arc::new(GlobalOutboundProbeBudget::new());
+    let transport_b = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
+        .await
+        .unwrap()
+        .with_global_probe_budget(global_budget.clone());
+    let peer_id = "peer-global";
+    let endpoint: SocketAddr = "203.0.113.1:49999".parse().unwrap();
+
+    for _ in 0..OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP {
+        assert_eq!(
+            global_budget.admit(peer_id, endpoint, 0).await,
+            OutboundProbeAdmission::Accepted
+        );
+    }
+
+    assert_eq!(
+        transport_b
+            .admit_outbound_connectivity_probe(peer_id, endpoint, 0)
+            .await,
+        OutboundProbeAdmission::GlobalRemoteIpRateLimited
+    );
+}
+
+#[tokio::test]
+async fn outbound_probe_budget_limits_across_peers_on_same_network() {
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peer_manager())
+        .await
+        .unwrap();
+
+    {
+        let now = Instant::now();
+        let mut budget = transport.outbound_probe_budget.lock().await;
+        budget.insert(
+            OutboundProbeBudgetKey::Network,
+            std::iter::repeat_n(now, OUTBOUND_PROBE_BUDGET_PER_NETWORK).collect(),
+        );
+    }
+
+    assert_eq!(
+        transport
+            .admit_outbound_connectivity_probe("peer-extra", "127.9.9.9:49999".parse().unwrap(), 0)
+            .await,
+        OutboundProbeAdmission::NetworkRateLimited
+    );
+}
+
+#[test]
+fn adaptive_probe_schedule_covers_all_candidates_on_final_round() {
+    let candidates = vec![
+        "127.0.0.1:10001".parse().unwrap(),
+        "127.0.0.1:10002".parse().unwrap(),
+        "127.0.0.1:10003".parse().unwrap(),
+        "127.0.0.1:10004".parse().unwrap(),
+        "127.0.0.1:10005".parse().unwrap(),
+    ];
+
+    let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 3);
+
+    assert_eq!(schedule.len(), 3);
+    assert_eq!(schedule[0].delay_before, Duration::ZERO);
+    assert_eq!(schedule[0].endpoints, candidates);
+    assert_eq!(schedule[1].delay_before, Duration::from_millis(60));
+    assert_eq!(schedule[1].endpoints, candidates);
+    assert_eq!(schedule[2].delay_before, Duration::from_millis(140));
+    assert_eq!(schedule[2].endpoints, candidates);
+}
+
+#[test]
+fn adaptive_probe_schedule_expands_large_candidate_sets_quickly() {
+    let candidates = (0..48)
+        .map(|i| format!("127.0.0.1:{}", 12_000 + i).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+
+    let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 4);
+
+    assert_eq!(schedule.len(), 4);
+    assert_eq!(schedule[0].endpoints.len(), 48);
+    assert_eq!(schedule[1].endpoints.len(), 24);
+    assert_eq!(schedule[2].endpoints.len(), 48);
+    assert_eq!(schedule[3].endpoints.len(), 48);
+}
+
+#[test]
+fn adaptive_probe_schedule_covers_large_candidate_tail_before_retries() {
+    let candidates = (0..384)
+        .map(|i| format!("127.0.0.1:{}", 20_000 + i).parse().unwrap())
+        .collect::<Vec<SocketAddr>>();
+
+    let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 10);
+
+    assert_eq!(schedule[0].endpoints, candidates);
+    assert_eq!(schedule[1].endpoints, candidates[..24]);
+}
+
+#[test]
+fn adaptive_probe_schedule_preserves_single_attempt_full_coverage() {
+    let candidates = vec![
+        "127.0.0.1:11001".parse().unwrap(),
+        "127.0.0.1:11002".parse().unwrap(),
+        "127.0.0.1:11001".parse().unwrap(),
+    ];
+
+    let schedule = build_probe_schedule(&candidates, Duration::from_millis(200), 1);
+
+    assert_eq!(schedule.len(), 1);
+    assert_eq!(schedule[0].delay_before, Duration::ZERO);
+    assert_eq!(
+        schedule[0].endpoints,
+        vec![
+            "127.0.0.1:11001".parse().unwrap(),
+            "127.0.0.1:11002".parse().unwrap(),
+        ]
+    );
+}
+
+fn establish_sessions() -> (TransportSession, TransportSession) {
+    let node_a = NodeIdentity::generate();
+    let node_b = NodeIdentity::generate();
+
+    let mut initiator = HandshakeInitiator::new(node_a, node_b.public_key(), None);
+    let mut responder = HandshakeResponder::new(node_b, None);
+
+    let init = initiator.create_initiation().unwrap();
+    let (response, node_b_keys) = responder.consume_initiation_and_respond(&init).unwrap();
+    let node_a_keys = initiator.consume_response(&response).unwrap();
+
+    (
+        TransportSession::new(node_a_keys),
+        TransportSession::new(node_b_keys),
+    )
+}
+
+#[tokio::test]
+async fn persistent_probe_budget_spans_retries() {
+    let global_budget = Arc::new(GlobalOutboundProbeBudget::new());
+    let peer_id = "peer-persistent";
+    let endpoint: SocketAddr = "203.0.113.5:45000".parse().unwrap();
+
+    // Fill the persistent peer budget with entries that are older than the
+    // 1-second short window but inside the 60-second persistent window: the
+    // short window refills every second, so without the persistent layer a
+    // retry cycle could re-emit the same volume forever across retries.
+    {
+        let now = Instant::now();
+        let mut state = global_budget.state.lock().await;
+        state.insert(
+            OutboundProbeBudgetKey::PeerPersistent(peer_id.to_string()),
+            std::iter::repeat_n(
+                now - OUTBOUND_PROBE_PERSISTENT_WINDOW + Duration::from_secs(5),
+                OUTBOUND_PROBE_PERSISTENT_PER_PEER,
+            )
+            .collect(),
+        );
+    }
+
+    // The short window is empty (all entries are older than 1s), yet the
+    // persistent layer must still reject: retries cannot bypass the long-term
+    // allowance through per-second window refills.
+    assert_eq!(
+        global_budget.admit(peer_id, endpoint, 0).await,
+        OutboundProbeAdmission::GlobalPeerPersistentRateLimited
+    );
+
+    // A different peer still has its own persistent allowance (per-peer
+    // isolation): a failing peer cannot exhaust the shared NAT's probe
+    // allowance for a healthy peer.
+    assert_eq!(
+        global_budget
+            .admit("peer-healthy", "203.0.113.6:45001".parse().unwrap(), 0)
+            .await,
+        OutboundProbeAdmission::Accepted
+    );
+
+    // The per-(peer, socket) persistent layer isolates local NAT sockets too.
+    let socket_peer = "peer-socket-bound";
+    {
+        let now = Instant::now();
+        let mut state = global_budget.state.lock().await;
+        state.insert(
+            OutboundProbeBudgetKey::PeerSocketPersistent(socket_peer.to_string(), 2),
+            std::iter::repeat_n(
+                now - OUTBOUND_PROBE_PERSISTENT_WINDOW + Duration::from_secs(5),
+                OUTBOUND_PROBE_PERSISTENT_PER_PEER_SOCKET,
+            )
+            .collect(),
+        );
+    }
+    assert_eq!(
+        global_budget.admit(socket_peer, endpoint, 2).await,
+        OutboundProbeAdmission::GlobalPeerSocketPersistentRateLimited
+    );
+    // The same peer on a different socket still has its own allowance.
+    assert_eq!(
+        global_budget.admit(socket_peer, endpoint, 3).await,
+        OutboundProbeAdmission::Accepted
+    );
+}

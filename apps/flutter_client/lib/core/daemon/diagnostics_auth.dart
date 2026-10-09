@@ -1,0 +1,110 @@
+// Per-process local diagnostics session token.
+//
+// The daemon generates a fresh random token at startup, writes it to a 0600
+// file next to its log file, and deletes it on shutdown. Native callers attach
+// it to every sensitive diagnostics request as `Authorization: Bearer <token>`;
+// only `/health` and `/status.version` are public.
+// The token never appears on the daemon command line or in the persisted
+// config, and it is per-process: after a daemon restart the file (and the
+// token) is regenerated, so callers always read it fresh.
+import 'dart:io';
+
+import 'package:flutter/services.dart';
+
+import '../platform/android_platform.dart';
+
+/// Platform-normalized directory the daemon writes its log and token files to.
+Directory defaultP2WlanLogDir() {
+  if (Platform.isAndroid) {
+    final cachedPath = cachedApplicationSupportDirectoryPath;
+    if (cachedPath != null && cachedPath.isNotEmpty) {
+      return Directory(cachedPath);
+    }
+  }
+  if (Platform.isMacOS) {
+    final home = Platform.environment['HOME'];
+    if (home != null && home.isNotEmpty) {
+      return Directory('$home/Library/Logs/p2wlan');
+    }
+  }
+  if (Platform.isWindows) {
+    final localAppData = Platform.environment['LOCALAPPDATA'];
+    if (localAppData != null && localAppData.isNotEmpty) {
+      return Directory('$localAppData\\p2wlan\\logs');
+    }
+  }
+  final home = Platform.environment['HOME'];
+  if (home != null && home.isNotEmpty) {
+    return Directory('$home/.local/state/p2wlan');
+  }
+  return Directory(
+    '${Directory.systemTemp.path}${Platform.pathSeparator}p2wlan',
+  );
+}
+
+/// Resolve the directory that the running daemon actually uses for its log
+/// and diagnostics token files. Android's private files directory cannot be
+/// inferred reliably from Dart's process environment, so ask the native
+/// application for it instead of applying a desktop HOME-based convention.
+Future<Directory> resolveP2WlanLogDir() async {
+  if (Platform.isAndroid) {
+    final directory = await resolveApplicationSupportDirectory();
+    if (directory == null) {
+      throw StateError('Android application support directory is unavailable.');
+    }
+    return directory;
+  }
+  return defaultP2WlanLogDir();
+}
+
+/// Path of the per-process diagnostics auth token file.
+String diagnosticsAuthTokenPath() {
+  return '${defaultP2WlanLogDir().path}${Platform.pathSeparator}p2wlan-daemon.diag-auth';
+}
+
+/// Read the current per-process diagnostics auth token, or `null` when the
+/// daemon has not written one yet (not running, or just starting up).
+Future<String?> readDiagnosticsAuthToken() async {
+  if (Platform.isAndroid) {
+    try {
+      final value = await const MethodChannel('p2wlan/android_vpn')
+          .invokeMethod<String>('diagnosticsAuthToken');
+      final token = value?.trim();
+      return token == null || token.isEmpty ? null : token;
+    } catch (_) {
+      return null;
+    }
+  }
+  final file = File(diagnosticsAuthTokenPath());
+  try {
+    if (!await file.exists()) return null;
+    final value = (await file.readAsString()).trim();
+    return value.isEmpty ? null : value;
+  } catch (_) {
+    return null;
+  }
+}
+
+Directory roomRuntimeDirectory(String profileId) {
+  if (!RegExp(r'^[a-f0-9]{64}$').hasMatch(profileId)) {
+    throw ArgumentError.value(profileId, 'profileId');
+  }
+  return Directory(
+    '${defaultP2WlanLogDir().path}${Platform.pathSeparator}rooms'
+    '${Platform.pathSeparator}$profileId',
+  );
+}
+
+Future<String?> readRoomDiagnosticsAuthToken(String profileId) async {
+  final file = File(
+    '${roomRuntimeDirectory(profileId).path}${Platform.pathSeparator}'
+    'p2wlan-daemon.diag-auth',
+  );
+  try {
+    if (!await file.exists() || await file.length() > 4096) return null;
+    final value = (await file.readAsString()).trim();
+    return value.isEmpty ? null : value;
+  } on FileSystemException {
+    return null;
+  }
+}

@@ -1,0 +1,4 @@
+# Matrix output, logs and per-round work trees are local experiment output.
+# Keep the executable research harnesses publishable without publishing
+# environment-specific evidence or generated data.
+artifacts/

@@ -1,0 +1,523 @@
+// Package signaling provides the authenticated WebSocket wake-up channel for
+// durable control-plane signals. Signal payloads remain in the database until
+// clients consume them through the HTTP API; WebSocket messages only wake the
+// intended device, so reconnects and process crashes cannot lose signals.
+package signaling
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"github.com/yhan-sun/p2wlan/server/auth"
+)
+
+const (
+	ProtocolName            = "p2wlan.signaling.v1"
+	ProtocolVersion         = 1
+	DefaultMaxConnections   = 10_000
+	sendQueueCapacity       = 64
+	readLimitBytes          = 64 << 10
+	writeWait               = 5 * time.Second
+	upgradeHandshakeTimeout = 5 * time.Second
+	pongWait                = 45 * time.Second
+	pingPeriod              = 20 * time.Second
+)
+
+var (
+	ErrHubClosed       = errors.New("signaling hub is closed")
+	ErrConnectionLimit = errors.New("signaling connection limit exceeded")
+)
+
+type serverMessage struct {
+	Type            string   `json:"type"`
+	ProtocolVersion int      `json:"protocol_version"`
+	NodeID          string   `json:"node_id,omitempty"`
+	NetworkID       string   `json:"network_id,omitempty"`
+	Sequence        uint64   `json:"sequence,omitempty"`
+	ServerTimeMS    int64    `json:"server_time_ms"`
+	Capabilities    []string `json:"capabilities,omitempty"`
+}
+
+type closeRequest struct {
+	code int
+	text string
+}
+
+// UpgradeGuard runs before a WebSocket upgrade and may retain a short-lived
+// critical-section release function until the authenticated connection has
+// been registered in the hub.  It is used by the control plane to make a
+// registration-session validation atomic with the upgrade/register window.
+// A guard writes its own HTTP error response and returns ok=false when it
+// rejects the request.
+type UpgradeGuard func(http.ResponseWriter, *http.Request) (release func(), ok bool)
+
+// Client is one authenticated device connection. Identity comes exclusively
+// from device credential claims; clients never self-declare node or network.
+type Client struct {
+	hub             *Hub
+	conn            *websocket.Conn
+	send            chan []byte
+	done            chan struct{}
+	closeReq        chan closeRequest
+	writerDone      chan struct{}
+	stopOnce        sync.Once
+	nodeID          string
+	networkID       string
+	registrationSeq int64
+	expiresAt       time.Time
+	sequence        atomic.Uint64
+}
+
+type TelemetryHandler func(reportingDeviceID, networkID string, registrationSeq int64, payload []byte) (interface{}, error)
+
+// Hub keeps at most one live WebSocket per device. It intentionally contains
+// no signal payloads; those remain durable in the database.
+type Hub struct {
+	mu               sync.RWMutex
+	clients          map[string]*Client
+	telemetryHandler TelemetryHandler
+	maxConnections   int
+	activeClients    int
+	closed           bool
+	connections      sync.WaitGroup
+}
+
+func (h *Hub) SetTelemetryHandler(handler TelemetryHandler) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.telemetryHandler = handler
+}
+
+func NewHub() *Hub {
+	return NewHubWithLimit(DefaultMaxConnections)
+}
+
+// NewHubFromEnv parses production configuration strictly so an invalid
+// resource limit cannot silently turn into a different operational policy.
+func NewHubFromEnv() (*Hub, error) {
+	maxConnections := DefaultMaxConnections
+	if raw := strings.TrimSpace(os.Getenv("SIGNAL_WS_MAX_CONNECTIONS")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return nil, fmt.Errorf("SIGNAL_WS_MAX_CONNECTIONS must be a positive integer")
+		}
+		maxConnections = parsed
+	}
+	return NewHubWithLimit(maxConnections), nil
+}
+
+func NewHubWithLimit(maxConnections int) *Hub {
+	if maxConnections <= 0 {
+		maxConnections = DefaultMaxConnections
+	}
+	return &Hub{
+		clients:        make(map[string]*Client),
+		maxConnections: maxConnections,
+	}
+}
+
+func (h *Hub) register(client *Client) (*Client, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil, ErrHubClosed
+	}
+	previous := h.clients[client.nodeID]
+	// A reconnect for the same authenticated device may use one temporary
+	// global overlap slot while its stale socket exits. Without the upper bound,
+	// one credential could reconnect faster than the old pumps close and grow
+	// activeClients (and goroutines/sockets) without limit.
+	if h.activeClients >= h.maxConnections {
+		if previous == nil || h.activeClients > h.maxConnections {
+			return nil, ErrConnectionLimit
+		}
+	}
+	h.clients[client.nodeID] = client
+	h.activeClients++
+	h.connections.Add(1)
+	return previous, nil
+}
+
+func (h *Hub) connectionDone() {
+	h.mu.Lock()
+	if h.activeClients > 0 {
+		h.activeClients--
+	}
+	h.mu.Unlock()
+	h.connections.Done()
+}
+
+func (h *Hub) unregister(client *Client) {
+	h.mu.Lock()
+	if h.clients[client.nodeID] == client {
+		delete(h.clients, client.nodeID)
+	}
+	h.mu.Unlock()
+}
+
+// Notify wakes the current connection for nodeID. False means the device is
+// offline or backpressured; the durable HTTP signal remains available.
+func (h *Hub) Notify(nodeID string) bool {
+	h.mu.RLock()
+	client := h.clients[nodeID]
+	h.mu.RUnlock()
+	if client == nil {
+		return false
+	}
+	sequence := client.sequence.Add(1)
+	message, err := json.Marshal(serverMessage{
+		Type:            "signals_available",
+		ProtocolVersion: ProtocolVersion,
+		Sequence:        sequence,
+		ServerTimeMS:    time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return false
+	}
+	if client.enqueue(message) {
+		return true
+	}
+	client.requestClose(websocket.ClosePolicyViolation, "signal notification backpressure")
+	return false
+}
+
+// Close disconnects all clients and prevents future registrations.
+func (h *Hub) Close() {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		h.connections.Wait()
+		return
+	}
+	h.closed = true
+	clients := make([]*Client, 0, len(h.clients))
+	for _, client := range h.clients {
+		clients = append(clients, client)
+	}
+	h.clients = make(map[string]*Client)
+	h.mu.Unlock()
+	for _, client := range clients {
+		client.requestClose(websocket.CloseGoingAway, "server shutdown")
+	}
+	h.connections.Wait()
+}
+
+func (c *Client) enqueue(message []byte) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	select {
+	case c.send <- message:
+		return true
+	case <-c.done:
+		return false
+	default:
+		return false
+	}
+}
+
+func (c *Client) stop() {
+	c.stopOnce.Do(func() { close(c.done) })
+}
+
+func (c *Client) requestClose(code int, text string) {
+	select {
+	case c.closeReq <- closeRequest{code: code, text: text}:
+	default:
+	}
+}
+
+// ServeWS upgrades a request already authenticated by RequireDeviceAuth.
+// An optional guard can fence an identity check with hub registration.  The
+// variadic form preserves the direct callers used by older tests and embeds.
+func ServeWS(hub *Hub, guards ...UpgradeGuard) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, err := auth.GetDeviceClaims(r.Context())
+		if err != nil {
+			http.Error(w, `{"error":"device authentication required"}`, http.StatusUnauthorized)
+			return
+		}
+		if claims.DeviceID == "" || claims.NetworkID == "" || claims.ExpiresAt <= time.Now().Unix() {
+			http.Error(w, `{"error":"invalid device identity"}`, http.StatusUnauthorized)
+			return
+		}
+		if !supportsProtocol(r.Header.Values("Sec-WebSocket-Protocol"), ProtocolName) {
+			http.Error(w, `{"error":"required websocket subprotocol is missing"}`, http.StatusUpgradeRequired)
+			return
+		}
+		var releaseGuard func()
+		if len(guards) > 0 && guards[0] != nil {
+			var ok bool
+			releaseGuard, ok = guards[0](w, r)
+			if !ok {
+				return
+			}
+			defer func() {
+				if releaseGuard != nil {
+					releaseGuard()
+				}
+			}()
+		}
+
+		upgrader := websocket.Upgrader{
+			HandshakeTimeout: upgradeHandshakeTimeout,
+			ReadBufferSize:   1024,
+			WriteBufferSize:  1024,
+			Subprotocols:     []string{ProtocolName},
+			CheckOrigin:      checkOrigin,
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+
+		regSeq := parseRegistrationSequence(r)
+		client := &Client{
+			hub:             hub,
+			conn:            conn,
+			send:            make(chan []byte, sendQueueCapacity),
+			done:            make(chan struct{}),
+			closeReq:        make(chan closeRequest, 1),
+			writerDone:      make(chan struct{}),
+			nodeID:          claims.DeviceID,
+			networkID:       claims.NetworkID,
+			registrationSeq: regSeq,
+			expiresAt:       time.Unix(claims.ExpiresAt, 0),
+		}
+		previous, err := hub.register(client)
+		// Registration session fencing only needs to cover validation through
+		// hub registration.  Keeping it during readPump would deadlock the next
+		// daemon registration behind a long-lived socket.
+		if releaseGuard != nil {
+			releaseGuard()
+			releaseGuard = nil
+		}
+		if err != nil {
+			_ = conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseTryAgainLater, err.Error()),
+				time.Now().Add(writeWait),
+			)
+			_ = conn.Close()
+			return
+		}
+		defer hub.connectionDone()
+		if previous != nil {
+			previous.requestClose(websocket.ClosePolicyViolation, "replaced by a newer device connection")
+		}
+
+		ready, _ := json.Marshal(serverMessage{
+			Type:            "ready",
+			ProtocolVersion: ProtocolVersion,
+			NodeID:          client.nodeID,
+			NetworkID:       client.networkID,
+			ServerTimeMS:    time.Now().UnixMilli(),
+			Capabilities:    []string{"path_telemetry_v1"},
+		})
+		if !client.enqueue(ready) {
+			hub.unregister(client)
+			_ = conn.Close()
+			return
+		}
+
+		go client.writePump()
+		client.readPump()
+		<-client.writerDone
+	}
+}
+
+func (c *Client) readPump() {
+	defer func() {
+		c.hub.unregister(c)
+		c.stop()
+		_ = c.conn.Close()
+	}()
+	c.conn.SetReadLimit(readLimitBytes)
+	_ = c.conn.SetReadDeadline(c.readDeadline())
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(c.readDeadline())
+	})
+	for {
+		messageType, data, err := c.conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		if messageType == websocket.BinaryMessage {
+			c.requestClose(websocket.CloseUnsupportedData, "binary message unsupported")
+			return
+		}
+		if messageType == websocket.TextMessage {
+			var msg struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(data, &msg); err != nil {
+				c.requestClose(websocket.ClosePolicyViolation, "invalid message format")
+				return
+			}
+			if msg.Type == "path_telemetry" {
+				c.hub.handleTelemetry(c, data)
+				continue
+			}
+			c.requestClose(websocket.CloseUnsupportedData, "server-to-client notification channel")
+			return
+		}
+	}
+}
+
+func (c *Client) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.stop()
+		_ = c.conn.Close()
+		close(c.writerDone)
+	}()
+	for {
+		select {
+		case message := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				return
+			}
+		case request := <-c.closeReq:
+			_ = c.conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(request.code, request.text),
+				time.Now().Add(writeWait),
+			)
+			return
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *Client) readDeadline() time.Time {
+	deadline := time.Now().Add(pongWait)
+	if c.expiresAt.Before(deadline) {
+		return c.expiresAt
+	}
+	return deadline
+}
+
+func supportsProtocol(values []string, expected string) bool {
+	for _, value := range values {
+		for _, protocol := range strings.Split(value, ",") {
+			if strings.TrimSpace(protocol) == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func checkOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err == nil && strings.EqualFold(parsed.Host, r.Host) {
+		return true
+	}
+	for _, allowed := range strings.Split(os.Getenv("CONTROL_ALLOWED_ORIGINS"), ",") {
+		if strings.TrimSpace(allowed) == origin {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Hub) Disconnect(nodeID string) {
+	h.mu.RLock()
+	client := h.clients[nodeID]
+	h.mu.RUnlock()
+	if client != nil {
+		// Stop accepting wake-ups before asking the writer to close the
+		// connection.  A registration handoff must not leave a short window in
+		// which Notify can enqueue a signal for the superseded daemon while its
+		// close request is waiting behind the writer's send queue.
+		client.stop()
+		client.requestClose(websocket.ClosePolicyViolation, "device authorization changed")
+	}
+}
+
+func (h *Hub) handleTelemetry(c *Client, data []byte) {
+	h.mu.RLock()
+	handler := h.telemetryHandler
+	isCurrent := (h.clients[c.nodeID] == c)
+	h.mu.RUnlock()
+	if !isCurrent || handler == nil {
+		return
+	}
+	result, err := handler(c.nodeID, c.networkID, c.registrationSeq, data)
+	if err == nil && result != nil {
+		if ackBytes, err := marshalTelemetryAck(result, data); err == nil {
+			c.enqueue(ackBytes)
+		}
+	}
+}
+
+// marshalTelemetryAck keeps the ingestion summary fields at the top level for
+// compatibility while adding the signaling envelope required by clients.  A
+// bare ingestion summary is not a valid server message; clients correctly
+// closed the WebSocket when they received one, which could delay durable
+// signal wake-ups until the HTTP fallback poll.
+func marshalTelemetryAck(result interface{}, request []byte) ([]byte, error) {
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	ack := make(map[string]interface{})
+	if err := json.Unmarshal(resultBytes, &ack); err != nil {
+		return nil, err
+	}
+
+	var frame struct {
+		SentAt  int64 `json:"sent_at"`
+		Payload struct {
+			SentAt int64 `json:"sent_at"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(request, &frame); err != nil {
+		return nil, err
+	}
+	sentAt := frame.SentAt
+	if frame.Payload.SentAt != 0 {
+		sentAt = frame.Payload.SentAt
+	}
+	ack["type"] = "path_telemetry_ack"
+	ack["protocol_version"] = ProtocolVersion
+	ack["sent_at"] = sentAt
+	return json.Marshal(ack)
+}
+
+func parseRegistrationSequence(r *http.Request) int64 {
+	values := r.Header.Values(auth.RegistrationSequenceHeader)
+	if len(values) != 1 {
+		return 0
+	}
+	seq, err := strconv.ParseInt(values[0], 10, 64)
+	if err != nil || seq <= 0 {
+		return 0
+	}
+	return seq
+}
