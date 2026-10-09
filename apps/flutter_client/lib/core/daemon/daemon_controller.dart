@@ -174,6 +174,10 @@ class DaemonController {
   static const envDaemonBin = 'P2WLAN_DAEMON_BIN';
   static const _readyPoll = Duration(milliseconds: 400);
   static const _macosReadyTimeout = Duration(seconds: 60);
+  // Windows 创建 TUN 以及首次处理路由和防火墙规则时，受主机负载或策略
+  // 影响可能超过 20 秒。必须等待 daemon 自己报告诊断端点就绪，才能判定
+  // 启动失败并清理已核验的子进程。
+  static const _windowsReadyTimeout = Duration(seconds: 45);
   static const _directReadyTimeout = Duration(seconds: 20);
   // The daemon runtime gives its task graph ten seconds to drain after a
   // shutdown signal. The GUI must allow that full budget plus scheduler
@@ -713,7 +717,11 @@ class DaemonController {
     // failure/timeout below.
     _lastLaunchExitProbeAt = null;
     _lastLaunchExitProbeResult = null;
-    final timeout = Platform.isMacOS ? _macosReadyTimeout : _directReadyTimeout;
+    final timeout = Platform.isMacOS
+        ? _macosReadyTimeout
+        : Platform.isWindows
+        ? _windowsReadyTimeout
+        : _directReadyTimeout;
     await startupTrace?.stageStart(11, 'health_wait');
     final startup = await _waitForHealth(
       settings.diagnosticsUrl,
