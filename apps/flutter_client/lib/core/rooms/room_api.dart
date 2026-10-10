@@ -14,6 +14,10 @@ class RoomConnectionStopped extends RoomException {
   const RoomConnectionStopped(super.message);
 }
 
+class RoomDiagnosticsException extends RoomException {
+  const RoomDiagnosticsException(super.message);
+}
+
 String roomControlServer(String value) {
   final uri = Uri.tryParse(value.trim());
   if (uri == null ||

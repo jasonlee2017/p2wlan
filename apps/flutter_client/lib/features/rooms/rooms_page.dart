@@ -313,6 +313,9 @@ class _RoomsPageState extends State<RoomsPage> {
         case RoomConnectionPhase.stopping:
           return '断开中';
         case RoomConnectionPhase.unavailable:
+          if (session.diagnosticsStale && session.snapshot != null) {
+            return '状态待更新';
+          }
           return '连接不可用';
         case RoomConnectionPhase.failed:
           return '需处理';
@@ -330,9 +333,14 @@ class _RoomsPageState extends State<RoomsPage> {
           : (session == null ? '未连接' : '连接中');
     }
 
-    if (currentSnapshot.peerSnapshotStale) return '状态待更新';
+    if (session?.diagnosticsStale == true || currentSnapshot.peerSnapshotStale) {
+      return '状态待更新';
+    }
     return RoomConnectivitySummary.fromSnapshot(currentSnapshot).label;
   }
+
+  bool _roomDiagnosticsStale(FriendRoom room) =>
+      _parallel.session(room.id)?.diagnosticsStale == true;
 
   String _message(Object error) =>
       error is RoomException ? error.message : '操作未完成，请检查连接后重试';
@@ -986,7 +994,7 @@ class _RoomsPageState extends State<RoomsPage> {
                 if (_roomSnapshot(room) case final snapshot?) ...[
                   const SizedBox(height: 8),
                   Text(
-                    snapshot.peerSnapshotStale
+                    _roomDiagnosticsStale(room) || snapshot.peerSnapshotStale
                         ? '链路信息待更新'
                         : RoomConnectivitySummary.fromSnapshot(snapshot)
                               .details,
@@ -1014,7 +1022,9 @@ class _RoomsPageState extends State<RoomsPage> {
     if (room.isOwner) return '我是房主';
     final snapshot = _roomSnapshot(room);
     if (snapshot == null) return '连接后测量';
-    if (snapshot.peerSnapshotStale) return '待更新';
+    if (_roomDiagnosticsStale(room) || snapshot.peerSnapshotStale) {
+      return '待更新';
+    }
     final ips = room.memberCount != null
         ? room.ownerDeviceIps
         : [
@@ -1094,7 +1104,8 @@ class _RoomsPageState extends State<RoomsPage> {
 
   Widget _deviceList(RoomRoster roster) {
     final snapshot = _roomSnapshot(roster.room);
-    final peers = snapshot?.peerSnapshotStale == false
+    final peers = snapshot?.peerSnapshotStale == false &&
+            !_roomDiagnosticsStale(roster.room)
         ? snapshot!.peers
         : <PeerSnapshot>[];
     final devices = [
@@ -1278,7 +1289,7 @@ class _RoomsPageState extends State<RoomsPage> {
         ? '未连接'
         : snapshot == null
         ? '本机未连接'
-        : snapshot.peerSnapshotStale
+        : _roomDiagnosticsStale(room) || snapshot.peerSnapshotStale
         ? '状态待更新'
         : mappingMismatch
         ? '地址待同步'
@@ -1555,7 +1566,8 @@ class _RoomsPageState extends State<RoomsPage> {
                 if (_roomSnapshot(room) case final snapshot?) ...[
                   const SizedBox(height: 8),
                   Text('本机 IP：${snapshot.virtualIp}'),
-                  if (!snapshot.peerSnapshotStale)
+                  if (!_roomDiagnosticsStale(room) &&
+                      !snapshot.peerSnapshotStale)
                     Text(
                       RoomConnectivitySummary.fromSnapshot(snapshot).details,
                     ),

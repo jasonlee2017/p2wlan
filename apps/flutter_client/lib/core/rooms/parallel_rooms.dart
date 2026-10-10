@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import '../daemon/daemon_controller.dart';
+import '../api/diagnostics_api.dart';
 import '../diagnostics/support_log_protocol.dart';
 import '../diagnostics/support_status_summary.dart';
 import '../models/diagnostics_models.dart';
@@ -61,6 +62,11 @@ class ParallelRoomSession {
   final RoomRuntime runtime;
   RoomConnectionPhase phase = RoomConnectionPhase.starting;
   DiagnosticsSnapshot? snapshot;
+
+  /// The daemon is still owned by this session, but its latest diagnostics
+  /// request failed. Keep the last validated snapshot for identity/context
+  /// while preventing the UI from presenting its peer paths as current.
+  bool diagnosticsStale = false;
   String? message;
   bool refreshing = false;
   int revision = 0;
@@ -690,6 +696,7 @@ class ParallelRooms extends ChangeNotifier {
         throw const RoomException('房间运行时身份不匹配');
       }
       entry.snapshot = snapshot;
+      entry.diagnosticsStale = false;
       entry.phase = RoomConnectionPhase.running;
       final runtime = entry.runtime;
       entry.message = runtime is RoomControlStatus
@@ -721,12 +728,26 @@ class ParallelRooms extends ChangeNotifier {
       if (!_disposed &&
           revision == entry.revision &&
           identical(_sessions[entry.plan.room.id], entry)) {
-        entry.snapshot = null;
-        entry.phase = RoomConnectionPhase.unavailable;
-        entry.message = '运行时或路由不可用；未显示过期的在线状态';
+        // A refused loopback connection is the only status failure that proves
+        // the daemon is gone. Bounded snapshot timeouts and route-check errors
+        // can happen while the dataplane remains healthy, so retain the last
+        // validated snapshot without launching another expensive process scan.
+        final retainSnapshot =
+            error is DiagnosticsApiException ||
+            error is RoomDiagnosticsException;
+        if (retainSnapshot && entry.snapshot != null) {
+          entry.diagnosticsStale = true;
+          entry.phase = RoomConnectionPhase.running;
+          entry.message = '状态暂时无法更新；保留最近一次有效连接状态';
+        } else {
+          entry.snapshot = null;
+          entry.diagnosticsStale = false;
+          entry.phase = RoomConnectionPhase.unavailable;
+          entry.message = '运行时或路由不可用；尚未取得有效连接状态';
+        }
         _rememberRoom(
           entry.plan,
-          snapshot: null,
+          snapshot: entry.snapshot,
           replaceSnapshot: true,
           phase: entry.phase,
           message: entry.message,

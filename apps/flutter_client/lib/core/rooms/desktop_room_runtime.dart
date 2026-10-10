@@ -94,7 +94,9 @@ class DesktopRoomRuntime implements RoomRuntime, RoomControlStatus {
       throw const RoomException('房间运行时身份或地址不匹配');
     }
     final routes = await _api.verifyRoutes(plan.settings.diagnosticsUrl);
-    if (!routes.healthy) throw const RoomException('房间路由未通过校验');
+    if (!routes.healthy) {
+      throw const RoomDiagnosticsException('房间路由未通过校验');
+    }
     return snapshot;
   }
 

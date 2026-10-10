@@ -219,4 +219,34 @@ void main() {
     expect(status.nodeId, 'node-a');
     expect(statusRequests, 2);
   });
+
+  test(
+    'allows slow Windows route inspection while the daemon remains healthy',
+    () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      server.listen((request) async {
+        if (request.uri.path != '/routes/verify') return;
+        await Future<void>.delayed(const Duration(seconds: 4));
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType.json
+          ..write(
+            '{"contractVersion":1,"interface":"p2r-test",'
+            '"mtu":1420,"healthy":true,"conflictCount":0,'
+            '"entries":[]}',
+          );
+        await request.response.close();
+      });
+
+      final api = DiagnosticsApi(
+        authTokenReader: () async => 'diag-test-token',
+      );
+      addTearDown(api.close);
+      final routes = await api.verifyRoutes(
+        'http://127.0.0.1:${server.port}/status',
+      );
+      expect(routes.healthy, isTrue);
+    },
+  );
 }
