@@ -326,7 +326,7 @@ Control Plane 和 Relay 位于 [`server/`](server/)。固定服务端发布包�
 
 ## 开发者
 
-Flutter 开发和发布统一使用 **Flutter 3.47.2 / Dart 3.13.2**，仓库根目录 `.fvmrc` 是本地 FVM、CI 和发布流水线的版本来源。
+Flutter 开发和发布统一使用 **Flutter 3.47.7 / Dart 3.13.5**，仓库根目录 `.fvmrc` 是本地 FVM、CI 和发布流水线的版本来源。
 
 仓库按职责拆分：
 

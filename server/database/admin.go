@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -31,19 +32,24 @@ type AdminOverview struct {
 }
 
 type AdminDeviceSummary struct {
-	ID          string `json:"id"`
-	OwnerID     string `json:"owner_id"`
-	Username    string `json:"username"`
-	DeviceName  string `json:"device_name"`
-	Platform    string `json:"platform"`
-	VirtualIP   string `json:"virtual_ip"`
-	NetworkID   string `json:"network_id"`
-	NetworkName string `json:"network_name"`
-	NATType     string `json:"nat_type"`
-	RelayRTTMS  *int64 `json:"relay_rtt_ms,omitempty"`
-	LastSeen    int64  `json:"last_seen"`
-	AppVersion  string `json:"app_version"`
-	Online      bool   `json:"online"`
+	ID                   string `json:"id"`
+	OwnerID              string `json:"owner_id"`
+	Username             string `json:"username"`
+	DeviceName           string `json:"device_name"`
+	Platform             string `json:"platform"`
+	VirtualIP            string `json:"virtual_ip"`
+	NetworkID            string `json:"network_id"`
+	NetworkName          string `json:"network_name"`
+	NATType              string `json:"nat_type"`
+	RelayRTTMS           *int64 `json:"relay_rtt_ms,omitempty"`
+	LastSeen             int64  `json:"last_seen"`
+	AppVersion           string `json:"app_version"`
+	Online               bool   `json:"online"`
+	OnlineSince          int64  `json:"online_since"`
+	LastOnlineAt         int64  `json:"last_online_at"`
+	CurrentOnlineSeconds int64  `json:"current_online_seconds"`
+	TotalOnlineSeconds   int64  `json:"total_online_seconds"`
+	OnlineSessionCount   int64  `json:"online_session_count"`
 }
 
 type AdminNetworkSummary struct {
@@ -71,6 +77,26 @@ type AdminRoomSummary struct {
 	OnlineDevices int    `json:"online_devices"`
 	JoinLocked    bool   `json:"join_locked"`
 	CreatedAt     int64  `json:"created_at"`
+	Active        bool   `json:"active"`
+}
+
+func (db *DB) SetAdminRoomActive(roomID string, active bool) error {
+	value := 0
+	if active {
+		value = 1
+	}
+	result, err := db.Exec(`UPDATE rooms SET active = ?, revision = revision + 1 WHERE network_id = ?`, value, strings.TrimSpace(roomID))
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 type AdminDevicePage struct {
@@ -78,6 +104,27 @@ type AdminDevicePage struct {
 	Limit  int                  `json:"limit"`
 	Offset int                  `json:"offset"`
 	Items  []AdminDeviceSummary `json:"items"`
+}
+
+// DeleteAdminDevice removes a device and all of its credentials, tunnels,
+// queued signals, and relay authorization state.
+func (db *DB) DeleteAdminDevice(deviceID string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`, strings.TrimSpace(deviceID)).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return sql.ErrNoRows
+	}
+	if err := revokeRoomDeviceTx(tx, strings.TrimSpace(deviceID), true); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type AdminNetworkPage struct {
@@ -142,13 +189,18 @@ func adminDeviceColumns() string {
 		d.relay_rtt_ms,
 		d.last_seen,
 		COALESCE(d.app_version, ''),
-		d.online`
+		d.online,
+		COALESCE((SELECT online_since FROM device_presence p WHERE p.device_id = d.id), 0),
+		COALESCE((SELECT total_online_seconds FROM device_presence p WHERE p.device_id = d.id), 0),
+		COALESCE((SELECT online_session_count FROM device_presence p WHERE p.device_id = d.id), 0),
+		COALESCE((SELECT last_online_at FROM device_presence p WHERE p.device_id = d.id), 0)`
 }
 
 func scanAdminDevice(row interface{ Scan(...any) error }, cutoff int64) (AdminDeviceSummary, error) {
 	var item AdminDeviceSummary
 	var online int
 	var relayRTT sql.NullInt64
+	var presence DevicePresenceSummary
 	err := row.Scan(
 		&item.ID,
 		&item.OwnerID,
@@ -163,12 +215,20 @@ func scanAdminDevice(row interface{ Scan(...any) error }, cutoff int64) (AdminDe
 		&item.LastSeen,
 		&item.AppVersion,
 		&online,
+		&presence.OnlineSince,
+		&presence.TotalOnlineSeconds,
+		&presence.OnlineSessionCount,
+		&presence.LastOnlineAt,
 	)
 	if err != nil {
 		return AdminDeviceSummary{}, err
 	}
 	item.Online = adminDeviceOnline(int64(online), item.LastSeen, cutoff)
 	item.RelayRTTMS = nullInt64Ptr(relayRTT)
+	item.OnlineSince = presence.OnlineSince
+	item.LastOnlineAt = presence.LastOnlineAt
+	item.OnlineSessionCount = presence.OnlineSessionCount
+	item.CurrentOnlineSeconds, item.TotalOnlineSeconds = effectivePresence(presence, item.Online, item.LastSeen, time.Now().Unix())
 	return item, nil
 }
 

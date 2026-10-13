@@ -4,6 +4,7 @@ import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/rooms/desktop_room_runtime.dart';
 import 'package:p2wlan_flutter_client/core/rooms/parallel_rooms.dart';
+import 'package:p2wlan_flutter_client/core/rooms/room_api.dart';
 import 'package:p2wlan_flutter_client/core/rooms/route_inventory.dart';
 
 import 'parallel_rooms_test.dart' as fixtures;
@@ -124,6 +125,28 @@ void main() {
     await expectLater(runtime.exists(), throwsStateError);
   });
 
+  test('local diagnostics 401 stops the room connection', () async {
+    final unauthorized = _UnauthorizedRoomApi(api.plan);
+    final unauthorizedDaemon = _RoomDaemon(unauthorized)..running = true;
+    final unauthorizedRuntime = DesktopRoomRuntime(
+      api.plan,
+      diagnosticsApi: unauthorized,
+      daemonController: unauthorizedDaemon,
+      hasCredentials: () async => true,
+    );
+    addTearDown(unauthorizedRuntime.close);
+    await expectLater(
+      unauthorizedRuntime.status(),
+      throwsA(
+        isA<RoomConnectionStopped>().having(
+          (error) => error.message,
+          'message',
+          contains('凭据已失效'),
+        ),
+      ),
+    );
+  });
+
   test(
     'disconnect then refresh with stale credentials allows reconnect',
     () async {
@@ -197,4 +220,16 @@ void main() {
     expect((await runtime.start()).ok, isFalse);
     expect(daemon.operations, isEmpty);
   });
+}
+
+class _UnauthorizedRoomApi extends _RoomApi {
+  _UnauthorizedRoomApi(super.plan);
+
+  @override
+  Future<DiagnosticsSnapshot> fetchStatus(String url) async {
+    throw const DiagnosticsApiException(
+      'GET /status returned HTTP 401',
+      statusCode: 401,
+    );
+  }
 }

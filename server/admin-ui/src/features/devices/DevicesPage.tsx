@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Search } from 'lucide-react'
 import { AccountScopePicker } from '../../AccountScopePicker'
 import { SnapshotExport } from '../../SnapshotExport'
@@ -8,12 +8,13 @@ import { tr } from '../../i18n'
 import { useCursorPage, usePageState } from '../../pageState'
 import { QueryStatus, useAutoRefresh } from '../../refresh'
 import { CursorPagination, ErrorBlock, Panel, PendingBlock, ResourceEmptyState, ResourceReturnLink, useDebouncedValue } from '../../shared/console'
-import type { ResourceAccountScope } from '../../types'
+import type { AdminDevice, ResourceAccountScope } from '../../types'
 import { DeviceTable } from '../resources/ResourceTables'
 const PAGE_SIZE = 25
 
 export function DevicesPage({ accountScope }: { accountScope?: ResourceAccountScope }) {
   const refreshInterval = useAutoRefresh()
+  const queryClient = useQueryClient()
   const { params, update } = usePageState()
   const paging = useCursorPage()
   const query = params.get('q') || ''
@@ -26,6 +27,15 @@ export function DevicesPage({ accountScope }: { accountScope?: ResourceAccountSc
     queryFn: ({ signal }) => adminApi.devicesSnapshot(debounced, status, paging.cursor, PAGE_SIZE, signal, accountId),
     refetchInterval: refreshInterval, enabled: debounced === query,
   })
+  const deleteDevice = async (device: AdminDevice) => {
+    if (!window.confirm(`确认删除设备“${device.device_name}”吗？删除后会释放其虚拟 IP。`)) return
+    try {
+      await adminApi.deleteDevice(device.id)
+      await queryClient.invalidateQueries({ queryKey: ['devices'] })
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '删除设备失败')
+    }
+  }
   return <div className="page-stack">
     {!accountScope && <ResourceReturnLink />}
     <PageHeader title={tr('设备')} description={<> {tr(account ? '所选账号下已注册的设备。' : '全部账号下已注册的 P2WLAN 设备。')} </>} actions={<><div className="toolbar-controls">
@@ -37,7 +47,7 @@ export function DevicesPage({ accountScope }: { accountScope?: ResourceAccountSc
     <Panel action={result.data && debounced === query && <SnapshotExport items={result.data.items} filename="devices" generatedAt={result.data.generated_at} total={result.data.total} scope={{ q: query, status, account_id: accountId, cursor: paging.cursor }} />}>
       {debounced === query && paging.cursor && result.error instanceof ApiError && result.error.status === 400 && <div className="resource-query-recovery"><button type="button" className="button secondary compact" onClick={() => update({ cursor: '', page: '' }, true)}>{tr('重新从首页加载')}</button></div>}
       {result.isPending || debounced !== query ? <PendingBlock queries={[result]} /> : result.error && !result.data ? <ErrorBlock error={result.error} onRetry={() => { void result.refetch() }} /> : result.data ? <>
-        {result.data.items.length ? <DeviceTable devices={result.data.items} accountId={accountId} /> : <ResourceEmptyState message="没有符合条件的设备" onClear={query || status !== 'all' || (!accountScope && accountId) ? () => update({ q: '', status: '', cursor: '', page: '', ...(!accountScope ? { account_id: '', account_name: '' } : {}) }) : undefined} />}
+        {result.data.items.length ? <DeviceTable devices={result.data.items} accountId={accountId} onDelete={deleteDevice} /> : <ResourceEmptyState message="没有符合条件的设备" onClear={query || status !== 'all' || (!accountScope && accountId) ? () => update({ q: '', status: '', cursor: '', page: '', ...(!accountScope ? { account_id: '', account_name: '' } : {}) }) : undefined} />}
         <CursorPagination total={result.data.total} pageIndex={paging.pageIndex} itemCount={result.data.items.length} limit={PAGE_SIZE} canNext={Boolean(result.data.next_cursor)} canPrev={paging.canPrev} previousIsFirst={paging.previousIsFirst} onPrev={paging.prev} onNext={() => paging.next(result.data?.next_cursor || '')} />
       </> : <ErrorBlock error={new Error('控制面未返回设备列表。')} />}
     </Panel>

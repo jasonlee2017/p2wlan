@@ -18,6 +18,8 @@ class DiagnosticsApi {
 
   static const _requestTimeout = Duration(milliseconds: 3500);
   static const _statusTimeout = Duration(seconds: 8);
+  // Windows route verification may invoke the native route provider.
+  static const _routeVerificationTimeout = Duration(seconds: 15);
   static const _speedTestTimeout = Duration(seconds: 45);
   static const _eventsTimeout = Duration(seconds: 30);
   static const _authRetryDelays = [
@@ -277,12 +279,14 @@ class DiagnosticsApi {
   Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async {
     final request = await _client
         .postUrl(_endpoint(diagnosticsUrl, '/routes/verify'))
-        .timeout(_requestTimeout);
+        .timeout(_routeVerificationTimeout);
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
     await _authorize(request);
     request.headers.contentLength = 0;
-    final response = await _closeRequest(request, _requestTimeout);
-    final body = await utf8.decodeStream(response).timeout(_requestTimeout);
+    final response = await _closeRequest(request, _routeVerificationTimeout);
+    final body = await utf8
+        .decodeStream(response)
+        .timeout(_routeVerificationTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw DiagnosticsApiException(
         'POST /routes/verify returned HTTP ${response.statusCode}',

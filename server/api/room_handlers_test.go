@@ -63,6 +63,9 @@ func TestRoomHTTPAuthenticationOwnershipAndDeviceProtocol(t *testing.T) {
 	request("POST", "/api/v1/rooms", a, map[string]any{"name": "room", "password": "safe-room-password", "owner_id": bu.ID}, 400)
 	created := request("POST", "/api/v1/rooms", a, map[string]any{"name": "room", "password": "safe-room-password"}, 201)["room"].(map[string]any)
 	roomID, code := created["id"].(string), created["room_code"].(string)
+	if err := db.SetAdminRoomActive(roomID, true); err != nil {
+		t.Fatal(err)
+	}
 	if created["owner_id"] != au.ID {
 		t.Fatal("owner not derived from authentication")
 	}

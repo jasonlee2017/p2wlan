@@ -33,6 +33,11 @@ export interface AdminDevice {
   last_seen: number
   app_version: string
   online: boolean
+  online_since: number
+  last_online_at: number
+  current_online_seconds: number
+  total_online_seconds: number
+  online_session_count: number
 }
 
 export interface AdminNetwork {
@@ -60,6 +65,7 @@ export interface AdminRoom {
   online_devices: number
   join_locked: boolean
   created_at: number
+  active: boolean
 }
 
 export interface AdminAccount {
@@ -72,6 +78,7 @@ export interface AdminAccount {
   room_count: number
   last_seen: number
   created_at: number
+  active: boolean
 }
 
 export interface AdminAccountDetail {

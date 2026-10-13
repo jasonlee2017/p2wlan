@@ -40,6 +40,14 @@ func migrate(db *sql.DB) error {
 		created_at  INTEGER NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS device_presence (
+		device_id             TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+		online_since          INTEGER NOT NULL DEFAULT 0,
+		total_online_seconds  INTEGER NOT NULL DEFAULT 0,
+		online_session_count  INTEGER NOT NULL DEFAULT 0,
+		last_online_at        INTEGER NOT NULL DEFAULT 0
+	);
+
 	CREATE TABLE IF NOT EXISTS tunnels (
 		id            TEXT PRIMARY KEY,
 		device_id     TEXT NOT NULL REFERENCES devices(id),
@@ -152,6 +160,14 @@ func migrate(db *sql.DB) error {
 
 	if _, err := db.Exec(schema); err != nil {
 		return err
+	}
+	if _, err := db.Exec(`
+		INSERT OR IGNORE INTO device_presence (device_id, online_since, online_session_count, last_online_at)
+		SELECT id, CASE WHEN online = 1 AND last_seen > 0 THEN last_seen ELSE 0 END,
+			CASE WHEN online = 1 AND last_seen > 0 THEN 1 ELSE 0 END,
+			CASE WHEN online = 1 AND last_seen > 0 THEN last_seen ELSE 0 END
+		FROM devices`); err != nil {
+		return fmt.Errorf("backfill device presence: %w", err)
 	}
 
 	// ALTER TABLE ADD COLUMN fails on an already-migrated database, so every

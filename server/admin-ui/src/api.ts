@@ -71,7 +71,7 @@ export async function verifyAdminToken(token: string, signal?: AbortSignal): Pro
   if (!response.ok) throw new ApiError(response.status, await parseError(response))
 }
 
-export async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
+export async function api<T>(path: string, signal?: AbortSignal, init?: RequestInit): Promise<T> {
   const token = getAdminToken()
   const revision = sessionRevision
   const assertCurrentSession = () => {
@@ -80,8 +80,12 @@ export async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
     }
   }
   assertCurrentSession()
+  const headers = new Headers(init?.headers)
+  headers.set('Authorization', `Bearer ${token}`)
+  headers.set('Accept', 'application/json')
   const response = await fetch(`/admin/api/v1${path}`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    ...init,
+    headers,
     cache: 'no-store',
     signal,
   })
@@ -116,6 +120,11 @@ function snapshotParams(cursor: string, limit: number, filters: AdminResourceFil
 }
 
 export const adminApi = {
+	setAccountActive: (id: string, active: boolean) => api<{ success: boolean; active: boolean }>(`/accounts/${encodeURIComponent(id)}/activation`, undefined, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) }),
+	setRoomActive: (id: string, active: boolean) => api<{ success: boolean; active: boolean }>(`/rooms/${encodeURIComponent(id)}/activation`, undefined, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) }),
+	deleteAccount: (id: string) => api<{ success: boolean }>(`/accounts/${encodeURIComponent(id)}`, undefined, { method: 'DELETE' }),
+	deleteRoom: (id: string) => api<{ success: boolean }>(`/rooms/${encodeURIComponent(id)}`, undefined, { method: 'DELETE' }),
+	deleteDevice: (id: string) => api<{ success: boolean }>(`/devices/${encodeURIComponent(id)}`, undefined, { method: 'DELETE' }),
   accountsSnapshot: (query = '', cursor = '', limit = 25, signal?: AbortSignal) =>
     api<SnapshotPage<AdminAccount>>(`/accounts?${snapshotParams(cursor, limit, { query })}`, signal),
   devicesSnapshot: (query = '', status = 'all', cursor = '', limit = 25, signal?: AbortSignal, accountId = '') => {

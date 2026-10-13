@@ -1,13 +1,15 @@
 import { type ColumnDef } from '@tanstack/react-table'
 import { useMemo } from 'react'
 import { Link, useLocation } from 'react-router-dom'
+import { Power, Trash2 } from 'lucide-react'
+import { adminApi } from '../../api'
 import { CopyValue } from '../../CopyValue'
-import { tr } from '../../i18n'
+import { getLocale, tr } from '../../i18n'
 import { connectionLink, relationshipLink, resourceOriginState } from '../../pageState'
-import { DataTable, Status, formatAgo, natLabel } from '../../shared/console'
+import { DataTable, Status, formatAgo, formatDate, natLabel } from '../../shared/console'
 import type { AdminDevice, AdminNetwork, AdminRoom } from '../../types'
 
-export function DeviceTable({ devices, accountId }: { devices: AdminDevice[]; accountId?: string }) {
+export function DeviceTable({ devices, accountId, onDelete }: { devices: AdminDevice[]; accountId?: string; onDelete?: (device: AdminDevice) => void }) {
   const location = useLocation()
   const columns = useMemo<ColumnDef<AdminDevice, unknown>[]>(() => [
     { id: 'device', header: '设备', cell: ({ row }) => <div className="primary-secondary"><Link state={resourceOriginState(location)} to={connectionLink({ deviceId: row.original.id, accountId })}>{row.original.device_name}</Link><span>{row.original.platform} · {row.original.app_version || tr('未知版本')}</span><TechnicalInfo key={row.original.id} id={row.original.id} name={row.original.device_name} label="设备 ID" copyLabel="复制设备 ID" facts={[{ label: 'NAT', value: natLabel(row.original.nat_type) }, { label: 'Relay RTT', value: row.original.relay_rtt_ms === undefined ? '—' : `${row.original.relay_rtt_ms} ms` }]} /></div> },
@@ -15,9 +17,29 @@ export function DeviceTable({ devices, accountId }: { devices: AdminDevice[]; ac
     { id: 'owner', header: '账号', cell: ({ row }) => row.original.owner_id ? <Link state={resourceOriginState(location)} to={`/accounts/${encodeURIComponent(row.original.owner_id)}`}>{row.original.username}</Link> : row.original.username },
     { id: 'network_name', header: '网络', cell: ({ row }) => <Link state={resourceOriginState(location)} to={relationshipLink(row.original.network_id, row.original.network_id === 'default' ? row.original.owner_id : accountId)}>{row.original.network_name}</Link> },
     { id: 'ip', header: 'Virtual IP', cell: ({ row }) => <span className="resource-primary-value"><code>{row.original.virtual_ip}</code><CopyValue compact value={row.original.virtual_ip} label="复制虚拟 IP" /></span> },
+    ...(onDelete ? [{ id: 'actions', header: '操作', cell: ({ row }: { row: { original: AdminDevice } }) => <button type="button" className="button danger compact" onClick={() => onDelete(row.original)} title="删除设备"><Trash2 size={14} />删除</button> }] : []),
     { id: 'last', header: '最后活动', cell: ({ row }) => formatAgo(row.original.last_seen) },
-  ], [accountId, location])
+    { id: 'presence', header: tr('在线时长'), cell: ({ row }) => <div className="primary-secondary"><span>{row.original.online ? `${tr('当前')} ${formatDuration(row.original.current_online_seconds)}` : `${tr('累计')} ${formatDuration(row.original.total_online_seconds)}`}</span><span>{row.original.online_session_count} {tr('次上线')}</span><span>{tr('最近上线')} {formatDate(row.original.online ? row.original.online_since : row.original.last_online_at)}</span></div> },
+  ], [accountId, location, onDelete])
   return <DataTable<AdminDevice> columns={columns} data={devices} empty={tr("没有符合条件的设备")} />
+}
+
+function formatDuration(seconds: number) {
+  const value = Math.max(0, Math.floor(seconds || 0))
+  const days = Math.floor(value / 86400)
+  const hours = Math.floor((value % 86400) / 3600)
+  const minutes = Math.floor((value % 3600) / 60)
+  const secs = value % 60
+  if (getLocale() === 'zh-CN') {
+    if (days) return `${days}天${hours}小时`
+    if (hours) return `${hours}小时${minutes}分`
+    if (minutes) return `${minutes}分${secs}秒`
+    return `${secs}秒`
+  }
+  if (days) return `${days}d ${hours}h`
+  if (hours) return `${hours}h ${minutes}m`
+  if (minutes) return `${minutes}m ${secs}s`
+  return `${secs}s`
 }
 
 export function NetworkTable({ networks, accountId }: { networks: AdminNetwork[]; accountId?: string }) {
@@ -34,17 +56,19 @@ export function NetworkTable({ networks, accountId }: { networks: AdminNetwork[]
   return <DataTable<AdminNetwork> columns={columns} data={networks} empty={tr("暂无网络")} />
 }
 
-export function RoomTable({ rooms, accountId }: { rooms: AdminRoom[]; accountId?: string }) {
+export function RoomTable({ rooms, accountId, onDelete, onSetActive }: { rooms: AdminRoom[]; accountId?: string; onDelete?: (room: AdminRoom) => void; onSetActive?: (room: AdminRoom) => void }) {
   const location = useLocation()
   const columns = useMemo<ColumnDef<AdminRoom, unknown>[]>(() => [
     { id: 'name', header: '房间', cell: ({ row }) => <div className="primary-secondary"><Link state={resourceOriginState(location)} to={relationshipLink(row.original.id, accountId)}>{row.original.name}</Link><div className="resource-primary-value"><code>#{row.original.code}</code><CopyValue compact value={row.original.code} label="复制房间码" /></div><TechnicalInfo key={row.original.id} id={row.original.id} name={row.original.name} label="房间 ID" copyLabel="复制房间 ID" /></div> },
     { id: 'cidr', header: 'CIDR', cell: ({ row }) => <span className="mono">{row.original.cidr}</span> },
     { id: 'owner', header: '所有者', cell: ({ row }) => row.original.owner_id ? <Link state={resourceOriginState(location)} to={`/accounts/${encodeURIComponent(row.original.owner_id)}`}>{row.original.owner_username}</Link> : row.original.owner_username },
+    { id: 'active', header: '状态', cell: ({ row }) => <button type="button" aria-pressed={row.original.active} className={`button compact activation-action ${row.original.active ? 'active' : 'pending'}`} onClick={() => void (onSetActive ? onSetActive(row.original) : adminApi.setRoomActive(row.original.id, !row.original.active))} title={row.original.active ? '停用房间' : '激活房间'}><Power size={14} />{row.original.active ? '已激活' : '待激活'}</button> },
+    ...(onDelete ? [{ id: 'actions', header: '操作', cell: ({ row }: { row: { original: AdminRoom } }) => <button type="button" className="button danger compact" onClick={() => onDelete(row.original)} title="删除房间"><Trash2 size={14} />删除</button> }] : []),
     { accessorKey: 'member_count', header: 'Members' },
     { id: 'devices', header: '设备', cell: ({ row }) => `${row.original.online_devices}/${row.original.device_count} ${tr('在线')}` },
     { id: 'join', header: '加入', cell: ({ row }) => <span className={`badge ${row.original.join_locked ? 'warning' : 'success'}`}>{tr(row.original.join_locked ? '已锁定' : '可加入')}</span> },
     { id: 'connections', header: '连接', cell: ({ row }) => <Link state={resourceOriginState(location)} className="text-link" to={connectionLink({ networkId: row.original.id, accountId })}>{tr('查看连接')}</Link> },
-  ], [accountId, location])
+  ], [accountId, location, onDelete, onSetActive])
   return <DataTable<AdminRoom> columns={columns} data={rooms} empty={tr("暂无房间")} />
 }
 

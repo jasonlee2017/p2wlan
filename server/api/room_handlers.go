@@ -142,7 +142,7 @@ func (s *Server) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	if !roomBody(w, r, &req) {
 		return
 	}
-	room, err := s.db.CreateRoom(actor, req.Name, req.Password)
+	room, err := s.db.CreatePendingRoom(actor, req.Name, req.Password)
 	if err != nil {
 		roomError(w, err)
 		return

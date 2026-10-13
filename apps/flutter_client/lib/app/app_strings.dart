@@ -781,6 +781,11 @@ class AppStrings {
       : 'This email is already registered. Sign in instead.';
   String get loginErrorRegistrationFailedBody =>
       isZh ? '注册失败，请稍后重试。' : 'Registration failed. Please try again.';
+  String get loginErrorRegistrationPendingTitle =>
+      isZh ? '注册成功' : 'Registration submitted';
+  String get loginErrorRegistrationPendingBody => isZh
+      ? '账号已创建，请等待服务器管理员激活后再登录。'
+      : 'Your account was created. Wait for a server administrator to activate it before signing in.';
   String get loginErrorRateLimitedBody =>
       isZh ? '请求过于频繁，请稍后再试。' : 'Too many attempts. Please try again later.';
   String get loginErrorNetworkTitle =>

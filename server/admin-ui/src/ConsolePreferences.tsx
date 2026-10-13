@@ -55,7 +55,7 @@ export function ConsolePreferences({ onLogout, onOpen }: { onLogout: () => void;
       <PreferenceRow label="界面主题"><select className="select-field theme-select" aria-label={tr('界面主题')} value={theme} onChange={(event) => setTheme(event.target.value as 'system' | 'light' | 'dark')}><option value="system">{tr('跟随系统')}</option><option value="light">{tr('浅色')}</option><option value="dark">{tr('深色')}</option></select></PreferenceRow>
       <PreferenceRow label="界面语言"><LanguageSwitch /></PreferenceRow>
       <div className="console-preference-row"><DensityToggle /></div>
-      <footer><span>{tr('只读管理模式')}</span><button type="button" className="button secondary compact" onClick={onLogout}><LogOut size={15} />{tr('退出登录')}</button></footer>
+      <footer><span>{tr('管理员控制台')}</span><button type="button" className="button secondary compact" onClick={onLogout}><LogOut size={15} />{tr('退出登录')}</button></footer>
     </section>}
   </div>
 }

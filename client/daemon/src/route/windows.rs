@@ -35,7 +35,6 @@ impl RouteManager {
             info!(
                 "Route for {destination_prefix} already exists on {interface} according to netsh — treating as idempotent, not owned"
             );
-            windows_ensure_icmp_echo_firewall_rule(&destination_prefix, &interface);
             return Ok(());
         }
 
@@ -47,7 +46,6 @@ impl RouteManager {
                 info!(
                     "Route for {destination_prefix} already exists on {interface} — treating as idempotent, not owned"
                 );
-                windows_ensure_icmp_echo_firewall_rule(&destination_prefix, &interface);
                 return Ok(());
             }
             return Err(crate::DaemonError::Network(format!(
@@ -72,7 +70,6 @@ impl RouteManager {
                     "New-NetRoute did not complete for {destination_prefix} via {interface}: {err}; trying netsh fallback"
                 );
                 windows_netsh_add_route(&destination_prefix, &interface, network, mask, self)?;
-                windows_ensure_icmp_echo_firewall_rule(&destination_prefix, &interface);
                 return Ok(());
             }
         };
@@ -108,7 +105,6 @@ impl RouteManager {
                     info!(
                         "Windows route for {destination_prefix} via {interface} already exists — treating New-NetRoute as idempotent"
                     );
-                    windows_ensure_icmp_echo_firewall_rule(&destination_prefix, &interface);
                     if let Ok(mut added) = self.routes_added.lock() {
                         added.push((network, mask));
                     }
@@ -132,15 +128,12 @@ impl RouteManager {
                     "New-NetRoute failed for {destination_prefix} via {interface}: {primary_error}; netsh fallback failed: {fallback_error}"
                 )));
             }
-            windows_ensure_icmp_echo_firewall_rule(&destination_prefix, &interface);
             return Ok(());
         }
 
         if let Ok(mut added) = self.routes_added.lock() {
             added.push((network, mask));
         }
-        windows_ensure_icmp_echo_firewall_rule(&destination_prefix, &interface);
-
         Ok(())
     }
 

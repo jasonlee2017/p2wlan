@@ -1,6 +1,7 @@
-param(
+﻿param(
     [string]$RepositoryRoot,
     [string]$OutputDirectory,
+    [string]$ReleaseDate,
     [switch]$BuildInstaller
 )
 
@@ -15,11 +16,6 @@ if (-not $RepositoryRoot) {
 } else {
     $RepositoryRoot = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 }
-
-if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $RepositoryRoot 'dist-release\windows-client-local'
-}
-$OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 
 foreach ($command in @('git', 'cargo', 'python3', 'flutter')) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
@@ -40,6 +36,18 @@ if (-not (Test-Path -LiteralPath $flutterDirectory)) {
 if (-not (Test-Path -LiteralPath $daemonProject)) {
     Stop-Build "daemon 工程不存在：$daemonProject"
 }
+
+$clientVersion = (Select-String -LiteralPath (Join-Path $flutterDirectory 'pubspec.yaml') -Pattern '^version:\s*([^+\s]+)').Matches[0].Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($ReleaseDate)) {
+    $ReleaseDate = (Get-Date).ToString('yyyy-MM-dd')
+}
+if ($ReleaseDate -notmatch '^\d{4}-\d{2}-\d{2}$') {
+    Stop-Build "ReleaseDate 必须使用 yyyy-MM-dd 格式：$ReleaseDate"
+}
+if (-not $OutputDirectory) {
+    $OutputDirectory = Join-Path $RepositoryRoot "release\client\windows\$ReleaseDate\$clientVersion"
+}
+$OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 
 Push-Location $RepositoryRoot
 try {
@@ -115,12 +123,17 @@ try {
 
     $portableZip = Join-Path $OutputDirectory 'p2wlan-windows-x64-portable.zip'
     Compress-Archive -Path (Join-Path $portableDirectory '*') -DestinationPath $portableZip -CompressionLevel Optimal
+    $portableHash = (Get-FileHash -LiteralPath $portableZip -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$portableHash  $(Split-Path $portableZip -Leaf)" | Set-Content -LiteralPath "$portableZip.sha256" -Encoding ascii
 
     if ($BuildInstaller) {
         $isccCandidates = @()
         $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
         foreach ($base in @($programFilesX86, $env:ProgramFiles)) {
             if ($base) { $isccCandidates += Join-Path $base 'Inno Setup 6\ISCC.exe' }
+        }
+        if ($env:LOCALAPPDATA) {
+            $isccCandidates += Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
         }
         if ($env:ChocolateyInstall) {
             $isccCandidates += Join-Path $env:ChocolateyInstall 'lib\innosetup\tools\ISCC.exe'
@@ -130,11 +143,11 @@ try {
             Stop-Build '未找到 Inno Setup 6。安装 Inno Setup 后重新运行，或省略 -BuildInstaller 先测试 portable 包。'
         }
 
-        $version = (Select-String -LiteralPath (Join-Path $flutterDirectory 'pubspec.yaml') -Pattern '^version:\s*([^+\s]+)').Matches[0].Groups[1].Value
         $iss = Join-Path $env:TEMP 'p2wlan-windows-local.iss'
         $source = $portableDirectory.Replace('"', '""')
         $output = $OutputDirectory.Replace('"', '""')
-        @"
+        $version = $clientVersion
+        $issContent = @"
 #define SourceDir "$source"
 #define OutputDir "$output"
 #define AppVersion "$version"
@@ -167,9 +180,13 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Run]
 Filename: "{app}\p2wlan_flutter_client.exe"; Description: "Launch P2WLAN"; Flags: nowait postinstall skipifsilent
-"@ | Set-Content -LiteralPath $iss -Encoding UTF8
+"@
+        $issContent | Set-Content -LiteralPath $iss -Encoding UTF8
         & $iscc $iss
         if ($LASTEXITCODE -ne 0) { Stop-Build 'Inno Setup 构建失败。' }
+        $setup = Join-Path $OutputDirectory 'p2wlan-windows-x64-setup.exe'
+        $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$setupHash  $(Split-Path $setup -Leaf)" | Set-Content -LiteralPath "$setup.sha256" -Encoding ascii
     }
 
     Write-Host "打包完成：$OutputDirectory"

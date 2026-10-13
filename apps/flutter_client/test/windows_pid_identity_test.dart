@@ -248,6 +248,23 @@ void main() {
     );
   });
 
+  test('Windows room PID markers validate the daemon identity', () {
+    final marker = WindowsPidMarker.parse('4242');
+    expect(marker.processId, 4242);
+    expect(
+      marker.matches(
+        const WindowsProcessProbe.running(r'C:\P2WLAN\p2wlan-daemon.exe'),
+      ),
+      isTrue,
+    );
+    expect(
+      marker.matches(const WindowsProcessProbe.running(r'C:\P2WLAN\other.exe')),
+      isFalse,
+    );
+    expect(() => WindowsPidMarker.parse('0'), throwsFormatException);
+    expect(() => WindowsPidMarker.parse('bad'), throwsFormatException);
+  });
+
   test('Windows PowerShell helper preserves Unicode output', () async {
     final api = DiagnosticsApi(authTokenReader: () async => null);
     addTearDown(api.close);

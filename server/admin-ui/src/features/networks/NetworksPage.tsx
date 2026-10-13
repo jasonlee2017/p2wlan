@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Search } from 'lucide-react'
 import { AccountScopePicker } from '../../AccountScopePicker'
 import { SnapshotExport } from '../../SnapshotExport'
@@ -8,12 +8,13 @@ import { tr } from '../../i18n'
 import { useCursorPage, usePageState, useResourceTabState } from '../../pageState'
 import { QueryStatus, useAutoRefresh } from '../../refresh'
 import { CursorPagination, ErrorBlock, Panel, PendingBlock, ResourceEmptyState, ResourceReturnLink, ResourceTabs, useDebouncedValue } from '../../shared/console'
-import type { ResourceAccountScope } from '../../types'
+import type { AdminRoom, ResourceAccountScope } from '../../types'
 import { NetworkTable, RoomTable } from '../resources/ResourceTables'
 const PAGE_SIZE = 25
 
 export function NetworksPage({ accountScope, fixedTab }: { accountScope?: ResourceAccountScope; fixedTab?: 'networks' | 'rooms' }) {
   const refreshInterval = useAutoRefresh()
+  const queryClient = useQueryClient()
   const { params, update } = usePageState()
   const tab = fixedTab || (params.get('tab') === 'rooms' ? 'rooms' : 'networks')
   const setTab = useResourceTabState(tab, 'networks', ['networks', 'rooms'])
@@ -26,6 +27,24 @@ export function NetworksPage({ accountScope, fixedTab }: { accountScope?: Resour
   const networks = useQuery({ queryKey: ['networks', 'snapshot', tab, accountId, debounced, paging.cursor], queryFn: ({ signal }) => adminApi.networksSnapshot(filters, paging.cursor, PAGE_SIZE, signal), enabled: tab === 'networks' && debounced === query, refetchInterval: refreshInterval })
   const rooms = useQuery({ queryKey: ['rooms', 'snapshot', tab, accountId, debounced, paging.cursor], queryFn: ({ signal }) => adminApi.roomsSnapshot(filters, paging.cursor, PAGE_SIZE, signal), enabled: tab === 'rooms' && debounced === query, refetchInterval: refreshInterval })
   const active = tab === 'networks' ? networks : rooms
+  const deleteRoom = async (room: AdminRoom) => {
+    if (!window.confirm(`确认删除房间“${room.name}”吗？删除后会释放房间设备和虚拟 IP。`)) return
+    try {
+      await adminApi.deleteRoom(room.id)
+      await queryClient.invalidateQueries({ queryKey: ['rooms'] })
+      await queryClient.invalidateQueries({ queryKey: ['networks'] })
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '删除房间失败')
+    }
+  }
+  const setRoomActive = async (room: AdminRoom) => {
+    try {
+      await adminApi.setRoomActive(room.id, !room.active)
+      await queryClient.invalidateQueries({ queryKey: ['rooms'] })
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '更新房间状态失败')
+    }
+  }
   return <div className="page-stack">
     {!accountScope && <ResourceReturnLink />}
     <PageHeader title={tr(fixedTab ? tab === 'rooms' ? '房间网络' : '全部网络' : '网络与房间')} description={<> {tr('全部网络包含普通网络和房间网络，房间网络提供加入状态和房间码。')} </>} actions={<><div className="toolbar-controls">
@@ -39,7 +58,7 @@ export function NetworksPage({ accountScope, fixedTab }: { accountScope?: Resour
         {debounced === query && paging.cursor && active.error instanceof ApiError && active.error.status === 400 && <div className="resource-query-recovery"><button type="button" className="button secondary compact" onClick={() => update({ cursor: '', page: '' }, true)}>{tr('重新从首页加载')}</button></div>}
         {active.isPending || debounced !== query ? <PendingBlock queries={[active]} /> : active.error && !active.data ? <ErrorBlock error={active.error} onRetry={() => { void active.refetch() }} /> : <>
           {tab === 'networks' && networks.data && (networks.data.items.length ? <NetworkTable networks={networks.data.items} accountId={accountId} /> : <ResourceEmptyState message="没有符合条件的网络" onClear={query || (!accountScope && accountId) ? () => update({ q: '', network_page: '', room_page: '', cursor: '', page: '', ...(!accountScope ? { account_id: '', account_name: '' } : {}) }) : undefined} />)}
-          {tab === 'rooms' && rooms.data && (rooms.data.items.length ? <RoomTable rooms={rooms.data.items} accountId={accountId} /> : <ResourceEmptyState message="没有符合条件的房间" onClear={query || (!accountScope && accountId) ? () => update({ q: '', network_page: '', room_page: '', cursor: '', page: '', ...(!accountScope ? { account_id: '', account_name: '' } : {}) }) : undefined} />)}
+          {tab === 'rooms' && rooms.data && (rooms.data.items.length ? <RoomTable rooms={rooms.data.items} accountId={accountId} onDelete={deleteRoom} onSetActive={setRoomActive} /> : <ResourceEmptyState message="没有符合条件的房间" onClear={query || (!accountScope && accountId) ? () => update({ q: '', network_page: '', room_page: '', cursor: '', page: '', ...(!accountScope ? { account_id: '', account_name: '' } : {}) }) : undefined} />)}
           {active.data && <CursorPagination total={active.data.total} pageIndex={paging.pageIndex} itemCount={active.data.items.length} limit={PAGE_SIZE} canNext={Boolean(active.data.next_cursor)} canPrev={paging.canPrev} previousIsFirst={paging.previousIsFirst} onPrev={paging.prev} onNext={() => paging.next(active.data?.next_cursor || '')} />}
         </>}
       </Panel>

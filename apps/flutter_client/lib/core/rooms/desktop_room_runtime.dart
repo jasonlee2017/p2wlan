@@ -88,14 +88,43 @@ class DesktopRoomRuntime implements RoomRuntime, RoomControlStatus {
   @override
   Future<DiagnosticsSnapshot> status() async {
     await _checkRemoteAccess();
-    final snapshot = await _api.fetchStatus(plan.settings.diagnosticsUrl);
-    if (snapshot.networkId != plan.room.id ||
-        !validRoomIp(snapshot.virtualIp, plan.room.cidr)) {
-      throw const RoomException('房间运行时身份或地址不匹配');
+    try {
+      final snapshot = await _api.fetchStatus(plan.settings.diagnosticsUrl);
+      if (snapshot.networkId != plan.room.id ||
+          !validRoomIp(snapshot.virtualIp, plan.room.cidr)) {
+        throw const RoomException(
+          '房间运行时身份或地址不匹配',
+          code: 'room_identity_mismatch',
+        );
+      }
+      final routes = await _api.verifyRoutes(plan.settings.diagnosticsUrl);
+      if (!routes.healthy) {
+        throw const RoomException('房间路由未通过校验', code: 'route_unavailable');
+      }
+      return snapshot;
+    } catch (error, stackTrace) {
+      if (error is RoomConnectionStopped) rethrow;
+      if (error is DiagnosticsApiException && error.statusCode == 401) {
+        throw const RoomConnectionStopped('本机房间凭据已失效，连接已停止，请重新登录后重连');
+      }
+      try {
+        if (!await exists()) {
+          final authenticationFailed = await logTailShowsPermanentAuthFailure(
+            _daemon.daemonLogPath,
+          );
+          throw RoomConnectionStopped(
+            authenticationFailed
+                ? '服务端拒绝了本机设备凭据，房间连接已停止；请重新登录或联系管理员恢复设备授权'
+                : '本机房间服务已退出，连接已停止，请重新连接',
+          );
+        }
+      } on RoomConnectionStopped {
+        rethrow;
+      } on Object {
+        // Keep the original diagnostics failure when process identity is unknown.
+      }
+      Error.throwWithStackTrace(error, stackTrace);
     }
-    final routes = await _api.verifyRoutes(plan.settings.diagnosticsUrl);
-    if (!routes.healthy) throw const RoomException('房间路由未通过校验');
-    return snapshot;
   }
 
   DateTime? _lastAccessCheck;

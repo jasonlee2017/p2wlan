@@ -163,6 +163,7 @@ struct InternalStartArgs {
 struct AuthResponse {
     success: Option<bool>,
     token: Option<String>,
+    activation_required: Option<bool>,
     error: Option<String>,
 }
 

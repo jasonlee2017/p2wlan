@@ -109,11 +109,16 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/v1/accounts/cursor", s.requireAdmin(s.accountsCursor))
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}/topology", s.requireAdmin(s.accountTopology))
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}", s.requireAdmin(s.account))
+	mux.HandleFunc("PATCH /admin/api/v1/accounts/{id}/activation", s.requireAdmin(s.accountActivation))
+	mux.HandleFunc("DELETE /admin/api/v1/accounts/{id}", s.requireAdmin(s.deleteAccount))
 	mux.HandleFunc("GET /admin/api/v1/topology", s.requireAdmin(s.topology))
 	mux.HandleFunc("GET /admin/api/v1/devices", s.requireAdmin(s.devices))
 	mux.HandleFunc("GET /admin/api/v1/devices/cursor", s.requireAdmin(s.devicesCursor))
+	mux.HandleFunc("DELETE /admin/api/v1/devices/{id}", s.requireAdmin(s.deleteDevice))
 	mux.HandleFunc("GET /admin/api/v1/networks", s.requireAdmin(s.networks))
 	mux.HandleFunc("GET /admin/api/v1/rooms", s.requireAdmin(s.rooms))
+	mux.HandleFunc("PATCH /admin/api/v1/rooms/{id}/activation", s.requireAdmin(s.roomActivation))
+	mux.HandleFunc("DELETE /admin/api/v1/rooms/{id}", s.requireAdmin(s.deleteRoom))
 	mux.HandleFunc("GET /admin/api/v1/connections", s.requireAdmin(s.connections))
 	mux.HandleFunc("GET /admin/api/v1/connection-transitions", s.requireAdmin(s.connectionTransitions))
 	mux.HandleFunc("GET /admin/api/v1/connection-health", s.requireAdmin(s.connectionHealth))
@@ -333,7 +338,7 @@ func (s *Server) runtime(w http.ResponseWriter, _ *http.Request) {
 		"build_commit":   emptyFallback(s.buildCommit, "unknown"),
 		"started_at":     s.startedAt.Unix(),
 		"uptime_seconds": int64(uptime / time.Second),
-		"admin_mode":     "read-only",
+		"admin_mode":     "control",
 	})
 }
 

@@ -133,7 +133,7 @@ fn windows_icmp_echo_firewall_script(destination_prefix: &str, interface: &str) 
 }
 
 #[cfg(target_os = "windows")]
-fn windows_ensure_icmp_echo_firewall_rule(destination_prefix: &str, interface: &str) {
+pub(crate) fn ensure_icmp_echo_firewall_rule(destination_prefix: &str, interface: &str) {
     let output = windows_powershell_output(
         &windows_icmp_echo_firewall_script(destination_prefix, interface),
         std::time::Duration::from_secs(8),

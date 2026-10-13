@@ -603,7 +603,7 @@ func TestRuntimeUsesBuildIdentity(t *testing.T) {
 		t.Fatalf("expected 200, got %d", res.Code)
 	}
 	body := res.Body.String()
-	for _, expected := range []string{`"build_version":"server-v1.2.3"`, `"build_commit":"0123456789abcdef"`, `"admin_mode":"read-only"`} {
+	for _, expected := range []string{`"build_version":"server-v1.2.3"`, `"build_commit":"0123456789abcdef"`, `"admin_mode":"control"`} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("runtime response missing %s: %s", expected, body)
 		}

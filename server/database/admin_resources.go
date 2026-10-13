@@ -110,7 +110,7 @@ func (db *DB) AdminRoomsFiltered(ctx context.Context, filter AdminResourceFilter
   (SELECT COUNT(*) FROM network_memberships m WHERE m.network_id=r.network_id),
   (SELECT COUNT(*) FROM devices d WHERE d.network_id=r.network_id),
   (SELECT COUNT(*) FROM devices d WHERE d.network_id=r.network_id AND `+adminOnlineLeaseSQL("d")+`),
-  r.join_locked,r.created_at`+from+where+`
+	  r.join_locked,r.created_at,r.active`+from+where+`
   ORDER BY r.created_at DESC,n.name COLLATE NOCASE ASC,r.network_id ASC LIMIT ? OFFSET ?`, listArgs...)
 	if err != nil {
 		return nil, err
@@ -118,11 +118,12 @@ func (db *DB) AdminRoomsFiltered(ctx context.Context, filter AdminResourceFilter
 	defer rows.Close()
 	for rows.Next() {
 		var item AdminRoomSummary
-		var locked int
-		if err := rows.Scan(&item.ID, &item.Code, &item.Name, &item.CIDR, &item.OwnerID, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &locked, &item.CreatedAt); err != nil {
+		var locked, active int
+		if err := rows.Scan(&item.ID, &item.Code, &item.Name, &item.CIDR, &item.OwnerID, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &locked, &item.CreatedAt, &active); err != nil {
 			return nil, err
 		}
 		item.JoinLocked = locked == 1
+		item.Active = active == 1
 		page.Items = append(page.Items, item)
 	}
 	if err := rows.Err(); err != nil {

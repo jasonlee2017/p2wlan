@@ -64,8 +64,20 @@ extension DaemonControllerPids on DaemonController {
         '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.pid';
     final file = File(pidPath);
     if (!await file.exists()) return null;
-    final pid = int.tryParse((await file.readAsString()).trim());
+    final markerText = (await file.readAsString()).trim();
+    WindowsPidMarker? marker;
+    if (Platform.isWindows) {
+      try {
+        marker = WindowsPidMarker.parse(markerText);
+      } on FormatException {
+        return null;
+      }
+    }
+    final pid = marker?.processId ?? int.tryParse(markerText);
     if (pid == null) return null;
+    if (marker != null && !marker.matches(queryWindowsProcess(pid))) {
+      return null;
+    }
     if (!await _processLooksLikeDaemon(pid)) return null;
     return pid;
   }
@@ -123,6 +135,37 @@ extension DaemonControllerPids on DaemonController {
   }
 
   Future<bool> _processLooksLikeDaemon(int pid) async {
+    if (Platform.isWindows && roomInstanceId != null) {
+      final markerPath =
+          '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.pid';
+      final markerFile = File(markerPath);
+      if (await markerFile.exists()) {
+        late final WindowsPidMarker marker;
+        try {
+          marker = WindowsPidMarker.parse(
+            (await markerFile.readAsString()).trim(),
+          );
+        } on FormatException {
+          return false;
+        }
+        if (marker.processId == pid) {
+          final process = queryWindowsProcess(pid);
+          if (process.state == WindowsProcessState.unavailable) {
+            throw StateError('Windows process identity is unavailable');
+          }
+          return marker.matches(process);
+        }
+        return false;
+      }
+      return pid == _authenticatedProcessId || pid == _launchedProcessId
+          ? trustedWindowsDaemonIdentityMatches(
+              pid: pid,
+              launchedProcessId: _launchedProcessId,
+              authenticatedProcessId: _authenticatedProcessId,
+              processName: await _windowsProcessName(pid),
+            )
+          : false;
+    }
     if (Platform.isWindows &&
         (pid == _authenticatedProcessId || pid == _launchedProcessId)) {
       return trustedWindowsDaemonIdentityMatches(
@@ -234,6 +277,31 @@ extension DaemonControllerPids on DaemonController {
     bool requireReliableScan = false,
   }) async {
     if (!Platform.isWindows) return const <int>[];
+    if (roomInstanceId != null) {
+      final markerPath =
+          '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.pid';
+      final markerFile = File(markerPath);
+      if (!await markerFile.exists()) return const <int>[];
+      late final WindowsPidMarker marker;
+      try {
+        marker = WindowsPidMarker.parse(
+          (await markerFile.readAsString()).trim(),
+        );
+      } on FormatException {
+        if (requireReliableScan) {
+          throw StateError('Room process identity is unavailable');
+        }
+        return const <int>[];
+      }
+      final process = queryWindowsProcess(marker.processId);
+      if (process.state == WindowsProcessState.unavailable) {
+        if (requireReliableScan) {
+          throw StateError('Room process identity is unavailable');
+        }
+        return const <int>[];
+      }
+      return marker.matches(process) ? [marker.processId] : const <int>[];
+    }
     final result = await _runWindowsPowerShell(
       '''@(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction ${requireReliableScan ? 'Stop' : 'SilentlyContinue'}) | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress''',
     );

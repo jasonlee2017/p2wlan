@@ -238,6 +238,48 @@ impl Daemon {
         }
         info!("[route] installed {cidr}");
 
+        // ICMP is a convenience rule for ping diagnostics.  It must not hold
+        // up daemon readiness: the Windows Firewall provider can take several
+        // seconds even when the firewall UI is disabled.  Keep the bounded,
+        // observable best-effort operation under TaskManager. Shutdown can
+        // cancel the async wrapper; the helper itself has a bounded 8-second
+        // child-process deadline, and a failure cannot make the daemon lie
+        // about route installation.
+        #[cfg(target_os = "windows")]
+        {
+            let firewall_cidr = cidr.clone();
+            let firewall_interface = self.route_manager.current_interface();
+            let firewall_manager = self.task_manager.clone();
+            let mut firewall_shutdown = self.shutdown_rx.clone();
+            firewall_manager
+                .spawn("windows-icmp-firewall", false, async move {
+                    let task = tokio::task::spawn_blocking(move || {
+                        crate::route::ensure_icmp_echo_firewall_rule(
+                            &firewall_cidr,
+                            &firewall_interface,
+                        );
+                    });
+                    tokio::pin!(task);
+                    tokio::select! {
+                        result = &mut task => {
+                            if let Err(error) = result {
+                                tracing::warn!(event = "overlay_icmp_firewall_task_failed", error = %error, "Windows ICMP firewall task stopped unexpectedly");
+                            }
+                            if !*firewall_shutdown.borrow() {
+                                let _ = firewall_shutdown.changed().await;
+                            }
+                        }
+                        changed = firewall_shutdown.changed() => {
+                            if changed.is_err() || *firewall_shutdown.borrow() {
+                                task.abort();
+                                tracing::debug!(event = "overlay_icmp_firewall_cancelled", "Windows ICMP firewall task cancelled during daemon shutdown");
+                            }
+                        }
+                    }
+                })
+                .await;
+        }
+
         let Some(outbound_rx) = self.outbound_rx.take() else {
             return Err(DaemonError::Network(
                 "outbound packet receiver already attached".to_string(),

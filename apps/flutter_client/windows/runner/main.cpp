@@ -24,6 +24,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   flutter::DartProject project(L"data");
 
+  // Keep the Windows release renderer on Skia. Flutter 3.47 enables
+  // Impeller by default, but older or virtualized Windows graphics drivers
+  // can initialize the engine successfully while presenting only a blank
+  // surface (and may terminate inside flutter_windows.dll). Skia remains the
+  // supported fallback for those machines and keeps the rendered UI visible.
+  project.set_impeller_switch(flutter::ImpellerSwitch::Disabled);
+
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();
 

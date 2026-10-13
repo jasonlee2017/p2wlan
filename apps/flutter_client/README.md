@@ -3,7 +3,7 @@
 Flutter frontend for the Rust P2WLAN client, paired with the Rust networking
 core.
 
-The supported toolchain is Flutter 3.47.2 with Dart 3.13.2. The repository-root
+The supported toolchain is Flutter 3.47.7 with Dart 3.13.5. The repository-root
 `.fvmrc` is the source of truth for local FVM, CI, and release builds.
 Public client support covers Windows, macOS 12+, Linux, and Android API 24+.
 iOS is outside the current support scope; retained iOS build files do not imply

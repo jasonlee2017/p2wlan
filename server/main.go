@@ -84,7 +84,7 @@ func main() {
 		log.Fatalf("Invalid control configuration: %v", err)
 	}
 
-	// Initialize the optional, read-only administration console. The console
+	// Initialize the optional administration console. The console
 	// uses an independent bearer token rather than extending user JWT privileges.
 	adminServer, err := admin.New(db, admin.Config{
 		Token:        getEnv("CONTROL_ADMIN_TOKEN", ""),
@@ -101,7 +101,7 @@ func main() {
 	adminServer.RegisterRoutes(mux)
 	apiServer.RegisterRoomRoutes(mux)
 	if adminServer.Enabled() {
-		log.Println("Admin console enabled at /admin/ (read-only)")
+		log.Println("Admin console enabled at /admin/")
 	}
 
 	// Public / auth-free routes

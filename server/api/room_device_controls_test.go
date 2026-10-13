@@ -49,6 +49,9 @@ func TestRoomDeviceControlsHTTP(t *testing.T) {
 		return result
 	}
 	room := request("POST", "/api/v1/rooms", owner, map[string]any{"name": "room", "password": "safe-password"}, 201)["room"].(map[string]any)
+	if err := db.SetAdminRoomActive(room["id"].(string), true); err != nil {
+		t.Fatal(err)
+	}
 	base := "/api/v1/rooms/" + room["id"].(string)
 	request("POST", "/api/v1/rooms/join", member, map[string]any{"room_code": room["room_code"], "password": "safe-password"}, 200)
 	request("PUT", base+"/device-policy", member, map[string]any{"require_approval": true}, 403)

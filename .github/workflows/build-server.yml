@@ -128,6 +128,91 @@ jobs:
             server/p2wlan-server-linux-${{ matrix.arch }}.tar.gz.sha256
           retention-days: 14
 
+  build-windows:
+    name: Build Windows server bundle (amd64)
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5021
+        with:
+          node-version: "22.16.0"
+          cache: npm
+          cache-dependency-path: server/admin-ui/package-lock.json
+
+      - name: Build embedded admin UI
+        working-directory: server/admin-ui
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run build
+          test -s ../admin/web/index.html
+          test -s ../admin/web/app.js
+          test -s ../admin/web/app.css
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab6
+        with:
+          go-version-file: server/go.mod
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: Test server
+        working-directory: server
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test ./... -count=1
+
+      - name: Build and checksum Windows server bundle
+        id: bundle
+        working-directory: server
+        shell: pwsh
+        env:
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/server-v') && github.ref_name || format('server-dev-{0}', github.sha) }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceSha = (git rev-parse HEAD).Trim()
+          "source_sha=$sourceSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $version = $env:VERSION
+          if ($version.StartsWith('server-dev-')) { $version = "server-dev-$sourceSha" }
+          $dist = Join-Path (Get-Location) 'dist-windows'
+          Remove-Item -LiteralPath $dist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $dist | Out-Null
+          $ldflags = "-s -w -X main.buildVersion=$version -X main.buildCommit=$sourceSha"
+          $env:CGO_ENABLED = '0'
+          go build -trimpath "-ldflags=$ldflags" -o (Join-Path $dist 'p2wlan-control.exe') .
+          go build -trimpath "-ldflags=$ldflags" -o (Join-Path $dist 'p2wlan-relay.exe') ./relay
+          go build -trimpath -o (Join-Path $dist 'p2wlan-config.exe') ./cmd/p2wlan-config
+          go build -trimpath -o (Join-Path $dist 'p2wlan-db.exe') ./cmd/p2wlan-db
+          Copy-Item ..\scripts\Update-P2WlanServer.ps1 $dist
+          Copy-Item ..\scripts\Update-P2WlanServer-D-Softwares.ps1 $dist
+          Copy-Item ..\scripts\Run-P2WlanRole.ps1 $dist
+          @("version=$version", "commit=$sourceSha", 'arch=amd64', (go version)) | Set-Content (Join-Path $dist 'BUILD-METADATA.txt') -Encoding ascii
+          Get-ChildItem $dist -Filter '*.exe' | Get-FileHash -Algorithm SHA256 | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), $_.Path.Substring($dist.Length + 1) } | Set-Content (Join-Path $dist 'SHA256SUMS') -Encoding ascii
+          $archive = Join-Path (Get-Location) 'p2wlan-server-windows-amd64.zip'
+          Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $archive -Leaf)" | Set-Content "$archive.sha256" -Encoding ascii
+
+      - name: Upload Windows server bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-server-windows-amd64-${{ steps.bundle.outputs.source_sha }}
+          path: |
+            server/p2wlan-server-windows-amd64.zip
+            server/p2wlan-server-windows-amd64.zip.sha256
+          retention-days: 14
+
   stage:
     name: Deploy verified bundle to staging
     needs: build
@@ -284,7 +369,7 @@ jobs:
 
   release:
     name: Publish server release
-    needs: build
+    needs: [build, build-windows]
     if: ${{ startsWith(github.ref, 'refs/tags/server-v') }}
     runs-on: ubuntu-22.04
     permissions:
@@ -293,7 +378,7 @@ jobs:
       - name: Download release bundles
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: p2wlan-server-linux-*-${{ github.sha }}
+          pattern: p2wlan-server-*-${{ github.sha }}
           path: release-assets
           merge-multiple: true
       - name: Verify release assets
@@ -304,10 +389,14 @@ jobs:
           set -euo pipefail
           for checksum in *.tar.gz.sha256; do sha256sum -c "$checksum"; done
           test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 1
           for archive in *.tar.gz; do
             actual_sha="$(tar -xOf "$archive" BUILD-METADATA.txt | awk -F= '/^commit=/{print $2; exit}')"
             test "$actual_sha" = "$EXPECTED_SHA"
           done
+          sha256sum -c p2wlan-server-windows-amd64.zip.sha256
+          unzip -p p2wlan-server-windows-amd64.zip BUILD-METADATA.txt | grep -Fx "commit=$EXPECTED_SHA"
+          unzip -p p2wlan-server-windows-amd64.zip BUILD-METADATA.txt | grep -E '^version=server-v'
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

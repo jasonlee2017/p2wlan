@@ -64,6 +64,7 @@ class ParallelRoomSession {
   String? message;
   bool refreshing = false;
   int revision = 0;
+  DateTime? lastSuccessfulRefreshAt;
 }
 
 typedef RoomRuntimeFactory = RoomRuntime Function(ParallelRoomPlan plan);
@@ -108,6 +109,7 @@ class ParallelRooms extends ChangeNotifier {
   var _disposed = false;
   Future<DaemonCommandResult>? _stoppingAll;
   String? lastError;
+  static const _snapshotRetentionWindow = Duration(seconds: 30);
 
   Map<String, ParallelRoomSession> get sessions => Map.unmodifiable(_sessions);
   Map<String, DiagnosticsSnapshot?> get recentRoomSnapshots =>
@@ -213,7 +215,10 @@ class ParallelRooms extends ChangeNotifier {
 
   bool get hasSessions =>
       _sessions.isNotEmpty || _operations.isNotEmpty || _recovering.isNotEmpty;
-  int get activeConnections => _sessions.length;
+  int get activeConnections => _sessions.values
+      .where((session) => session.phase == RoomConnectionPhase.running)
+      .length;
+  int get occupiedConnectionSlots => _sessions.length;
   bool get connectionsPaused => _admissionPauses > 0;
   bool get stoppingAll => _stoppingAll != null;
   bool get busy =>
@@ -396,6 +401,8 @@ class ParallelRooms extends ChangeNotifier {
       phase: RoomConnectionPhase.starting,
     );
     _notify();
+    entry.message = '正在检查本机路由并启动房间服务';
+    _notify();
     DaemonCommandResult started;
     try {
       await preferences.update(
@@ -435,6 +442,8 @@ class ParallelRooms extends ChangeNotifier {
           ? (started.ok ? _fail('登录状态已变化，连接已取消') : started)
           : cleanup;
     }
+    entry.message = '正在验证房间路由和数据链路';
+    _notify();
     await _refresh(entry);
     _schedulePoll();
     if (entry.phase != RoomConnectionPhase.running) {
@@ -627,30 +636,18 @@ class ParallelRooms extends ChangeNotifier {
           return _ok();
         }
         final runtime = runtimeFactory(plan);
-        final entry = ParallelRoomSession(plan, runtime);
-        _sessions[room.id] = entry;
-        _rememberRoom(
-          plan,
-          snapshot: null,
-          replaceSnapshot: true,
-          phase: RoomConnectionPhase.starting,
-        );
+        bool running;
         try {
-          if (!await runtime.exists()) {
-            _sessions.remove(room.id);
-            _rememberRoom(
-              plan,
-              snapshot: null,
-              replaceSnapshot: true,
-              phase: RoomConnectionPhase.unavailable,
-              message: '未发现房间运行时；保留本次实例日志供支持分析',
-            );
-            runtime.close();
-            return _ok();
-          }
+          // Probe before publishing a session. The room page polls recovery
+          // while it is open; publishing the provisional entry first makes
+          // the connect button briefly claim that an unconnected room is
+          // running.
+          running = await runtime.exists();
         } catch (_) {
-          entry.phase = RoomConnectionPhase.failed;
-          entry.message = '无法确认房间进程状态，请重试断开';
+          final entry = ParallelRoomSession(plan, runtime)
+            ..phase = RoomConnectionPhase.failed
+            ..message = '无法确认房间进程状态，请重试断开';
+          _sessions[room.id] = entry;
           _rememberRoom(
             plan,
             snapshot: null,
@@ -660,11 +657,30 @@ class ParallelRooms extends ChangeNotifier {
           );
           return _fail(entry.message!);
         }
+        if (!running) {
+          _rememberRoom(
+            plan,
+            snapshot: null,
+            replaceSnapshot: true,
+            phase: RoomConnectionPhase.unavailable,
+            message: '未发现房间运行时；保留本次实例日志供支持分析',
+          );
+          runtime.close();
+          return _ok();
+        }
+        final entry = ParallelRoomSession(plan, runtime);
+        _sessions[room.id] = entry;
+        _rememberRoom(
+          plan,
+          snapshot: null,
+          replaceSnapshot: true,
+          phase: RoomConnectionPhase.starting,
+        );
+        await _refresh(entry);
         if (_credentialKey(account) != _credentialKey(readSettings()) ||
             _stoppingAll != null) {
           return _disconnect(room.id);
         }
-        await _refresh(entry);
         _schedulePoll();
         return _ok();
       });
@@ -691,6 +707,7 @@ class ParallelRooms extends ChangeNotifier {
       }
       entry.snapshot = snapshot;
       entry.phase = RoomConnectionPhase.running;
+      entry.lastSuccessfulRefreshAt = DateTime.now();
       final runtime = entry.runtime;
       entry.message = runtime is RoomControlStatus
           ? (runtime as RoomControlStatus).controlWarning
@@ -718,19 +735,63 @@ class ParallelRooms extends ChangeNotifier {
         lastError = message;
         return;
       }
+      if (entry.lastSuccessfulRefreshAt != null &&
+          !_disposed &&
+          revision == entry.revision &&
+          identical(_sessions[entry.plan.room.id], entry)) {
+        var runtimePresent = true;
+        var runtimeKnown = false;
+        try {
+          runtimePresent = await entry.runtime.exists();
+          runtimeKnown = true;
+        } catch (_) {
+          // Keep ownership when the process identity cannot be verified.
+        }
+        if (runtimeKnown &&
+            !runtimePresent &&
+            !_disposed &&
+            revision == entry.revision &&
+            identical(_sessions[entry.plan.room.id], entry)) {
+          entry.message = '本机房间服务已退出，正在清理连接状态';
+          final stopped = await _disconnect(entry.plan.room.id);
+          if (stopped.ok) {
+            lastError = '本机房间服务已退出，连接已停止，可重新连接';
+            return;
+          }
+        }
+      }
       if (!_disposed &&
           revision == entry.revision &&
           identical(_sessions[entry.plan.room.id], entry)) {
-        entry.snapshot = null;
-        entry.phase = RoomConnectionPhase.unavailable;
-        entry.message = '运行时或路由不可用；未显示过期的在线状态';
-        _rememberRoom(
-          entry.plan,
-          snapshot: null,
-          replaceSnapshot: true,
-          phase: entry.phase,
-          message: entry.message,
-        );
+        final lastSuccess = entry.lastSuccessfulRefreshAt;
+        final retainSnapshot =
+            entry.snapshot != null &&
+            lastSuccess != null &&
+            DateTime.now().difference(lastSuccess) <=
+                _snapshotRetentionWindow &&
+            (error is! RoomException || error.code == 'route_unavailable');
+        if (retainSnapshot) {
+          entry.phase = RoomConnectionPhase.running;
+          entry.message = '房间状态同步暂时失败，正在重试';
+          _rememberRoom(
+            entry.plan,
+            snapshot: entry.snapshot,
+            replaceSnapshot: true,
+            phase: entry.phase,
+            message: entry.message,
+          );
+        } else {
+          entry.snapshot = null;
+          entry.phase = RoomConnectionPhase.unavailable;
+          entry.message = '运行时或路由不可用；未显示过期的在线状态';
+          _rememberRoom(
+            entry.plan,
+            snapshot: null,
+            replaceSnapshot: true,
+            phase: entry.phase,
+            message: entry.message,
+          );
+        }
       }
     } finally {
       entry.refreshing = false;

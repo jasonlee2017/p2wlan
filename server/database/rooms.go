@@ -34,7 +34,7 @@ var (
 
 const RoomAuthorizationLeaseSeconds = 30
 const roomSubnetQuarantineSeconds = 300
-const roomColumns = `r.network_id, r.room_code, n.name, n.cidr, r.owner_id, r.join_locked, r.revision, r.created_at`
+const roomColumns = `r.network_id, r.room_code, n.name, n.cidr, r.owner_id, r.join_locked, r.revision, r.created_at, r.active`
 
 var roomDummyHash, _ = bcrypt.GenerateFromPassword([]byte("p2wlan-room-dummy-credential"), bcrypt.DefaultCost)
 
@@ -53,6 +53,7 @@ type Room struct {
 	JoinLocked bool   `json:"join_locked"`
 	Revision   int64  `json:"revision"`
 	CreatedAt  int64  `json:"created_at"`
+	Active     bool   `json:"active"`
 	Role       string `json:"role"`
 }
 
@@ -92,7 +93,8 @@ func migrateRooms(db *sql.DB) error {
 		password_hash BLOB NOT NULL,
 		join_locked INTEGER NOT NULL DEFAULT 0,
 		revision INTEGER NOT NULL DEFAULT 1,
-		created_at INTEGER NOT NULL
+		created_at INTEGER NOT NULL,
+		active INTEGER NOT NULL DEFAULT 1
 	);
 	CREATE TABLE IF NOT EXISTS room_subnets (
 		cidr TEXT PRIMARY KEY,
@@ -133,6 +135,11 @@ func migrateRooms(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	if exists, err := columnExists(db, "rooms", "active"); err != nil {
+		return err
+	} else if !exists {
+		if _, err := db.Exec(`ALTER TABLE rooms ADD COLUMN active INTEGER NOT NULL DEFAULT 1`); err != nil { return err }
+	}
 	return migrateRoomDevices(db)
 }
 
@@ -169,7 +176,7 @@ func roomPasswordHash(password string) ([]byte, error) {
 
 func scanRoom(row interface{ Scan(...any) error }) (*Room, error) {
 	r := &Room{DeviceControlsVersion: 1}
-	err := row.Scan(&r.ID, &r.Code, &r.Name, &r.CIDR, &r.OwnerID, &r.JoinLocked, &r.Revision, &r.CreatedAt)
+	err := row.Scan(&r.ID, &r.Code, &r.Name, &r.CIDR, &r.OwnerID, &r.JoinLocked, &r.Revision, &r.CreatedAt, &r.Active)
 	return r, err
 }
 
@@ -190,7 +197,23 @@ func (db *DB) IsRoom(networkID string) (bool, error) {
 	return yes, err
 }
 
+func (db *DB) IsRoomActive(networkID string) (bool, error) {
+	var active bool
+	err := db.QueryRow(`SELECT active FROM rooms WHERE network_id = ?`, networkID).Scan(&active)
+	return active, err
+}
+
 func (db *DB) CreateRoom(ownerID, name, password string) (*Room, error) {
+	return db.createRoom(ownerID, name, password, true)
+}
+
+// CreatePendingRoom creates a room that remains unavailable until an
+// administrator activates it. The public HTTP room-creation endpoint uses it.
+func (db *DB) CreatePendingRoom(ownerID, name, password string) (*Room, error) {
+	return db.createRoom(ownerID, name, password, false)
+}
+
+func (db *DB) createRoom(ownerID, name, password string, active bool) (*Room, error) {
 	name = strings.TrimSpace(name)
 	if !validRoomName(name) {
 		return nil, ErrRoomInvalid
@@ -241,7 +264,9 @@ func (db *DB) CreateRoom(ownerID, name, password string) (*Room, error) {
 	if _, err := tx.Exec(`INSERT INTO networks (id, name, cidr, owner_id, created_at) VALUES (?, ?, ?, ?, ?)`, id, name, cidr, ownerID, now); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(`INSERT INTO rooms (network_id, room_code, owner_id, password_hash, created_at) VALUES (?, ?, ?, ?, ?)`, id, code, ownerID, hash, now); err != nil {
+	activeValue := 0
+	if active { activeValue = 1 }
+	if _, err := tx.Exec(`INSERT INTO rooms (network_id, room_code, owner_id, password_hash, created_at, active) VALUES (?, ?, ?, ?, ?, ?)`, id, code, ownerID, hash, now, activeValue); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(`INSERT INTO network_memberships (id, user_id, network_id, role, created_at) VALUES (?, ?, ?, 'owner', ?)`, "mem-"+id, ownerID, id, now); err != nil {
@@ -253,7 +278,7 @@ func (db *DB) CreateRoom(ownerID, name, password string) (*Room, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &Room{ID: id, Code: code, Name: name, CIDR: cidr, OwnerID: ownerID, CreatedAt: now, Revision: 1, Role: "owner", DeviceControlsVersion: 1}, nil
+	return &Room{ID: id, Code: code, Name: name, CIDR: cidr, OwnerID: ownerID, CreatedAt: now, Revision: 1, Role: "owner", DeviceControlsVersion: 1, Active: active}, nil
 }
 
 func allocateRoomSubnet(tx *sql.Tx, now int64) (string, error) {
@@ -302,7 +327,7 @@ func (db *DB) ListRooms(userID string) ([]Room, error) {
  (SELECT COUNT(*) FROM network_memberships WHERE network_id = r.network_id),
  (SELECT COUNT(DISTINCT d.user_id) FROM devices d JOIN network_memberships nm ON nm.user_id = d.user_id AND nm.network_id = d.network_id WHERE d.network_id = r.network_id AND d.online = 1 AND d.last_seen > 0 AND d.last_seen >= ?),
  COALESCE((SELECT GROUP_CONCAT(virtual_ip) FROM devices WHERE network_id = r.network_id AND user_id = r.owner_id AND online = 1 AND last_seen > 0 AND last_seen >= ?), '')
- FROM rooms r JOIN networks n ON n.id = r.network_id JOIN network_memberships m ON m.network_id = r.network_id WHERE m.user_id = ? ORDER BY CASE WHEN r.owner_id = ? THEN 0 ELSE 1 END, r.created_at, r.network_id`, time.Now().Unix()-DeviceOnlineTTL, time.Now().Unix()-DeviceOnlineTTL, userID, userID)
+ FROM rooms r JOIN networks n ON n.id = r.network_id JOIN network_memberships m ON m.network_id = r.network_id WHERE r.active = 1 AND m.user_id = ? ORDER BY CASE WHEN r.owner_id = ? THEN 0 ELSE 1 END, r.created_at, r.network_id`, time.Now().Unix()-DeviceOnlineTTL, time.Now().Unix()-DeviceOnlineTTL, userID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -312,9 +337,11 @@ func (db *DB) ListRooms(userID string) ([]Room, error) {
 		var r Room
 		r.DeviceControlsVersion = 1
 		var ownerIPs string
-		if err := rows.Scan(&r.ID, &r.Code, &r.Name, &r.CIDR, &r.OwnerID, &r.JoinLocked, &r.Revision, &r.CreatedAt, &r.Role, &r.OwnerUsername, &r.MemberCount, &r.OnlineMemberCount, &ownerIPs); err != nil {
+		var active int
+		if err := rows.Scan(&r.ID, &r.Code, &r.Name, &r.CIDR, &r.OwnerID, &r.JoinLocked, &r.Revision, &r.CreatedAt, &active, &r.Role, &r.OwnerUsername, &r.MemberCount, &r.OnlineMemberCount, &ownerIPs); err != nil {
 			return nil, err
 		}
+		r.Active = active == 1
 		r.OwnerDeviceIPs = []string{}
 		if ownerIPs != "" {
 			r.OwnerDeviceIPs = strings.Split(ownerIPs, ",")
@@ -330,7 +357,7 @@ func (db *DB) GetRoom(userID, roomID string) (*RoomDetails, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	room, err := scanRoom(tx.QueryRow(`SELECT `+roomColumns+` FROM rooms r JOIN networks n ON n.id = r.network_id JOIN network_memberships m ON m.network_id = r.network_id WHERE r.network_id = ? AND m.user_id = ?`, roomID, userID))
+	room, err := scanRoom(tx.QueryRow(`SELECT `+roomColumns+` FROM rooms r JOIN networks n ON n.id = r.network_id JOIN network_memberships m ON m.network_id = r.network_id WHERE r.network_id = ? AND r.active = 1 AND m.user_id = ?`, roomID, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrRoomAccess
 	}
@@ -450,7 +477,7 @@ func (db *DB) JoinRoom(userID, code, password, inviteToken string) (*Room, error
 		return nil, err
 	}
 	defer tx.Rollback()
-	room, err := scanRoom(tx.QueryRow(`SELECT `+roomColumns+` FROM rooms r JOIN networks n ON n.id = r.network_id WHERE r.network_id = ? AND r.revision = ?`, roomID, revision))
+	room, err := scanRoom(tx.QueryRow(`SELECT `+roomColumns+` FROM rooms r JOIN networks n ON n.id = r.network_id WHERE r.network_id = ? AND r.active = 1 AND r.revision = ?`, roomID, revision))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrRoomJoin
 	}
@@ -777,6 +804,10 @@ func (db *DB) DeleteRoom(actorID, roomID string) ([]string, error) {
 	if err := roomOwner(tx, actorID, roomID); err != nil {
 		return nil, err
 	}
+	return deleteRoomTx(tx, roomID)
+}
+
+func deleteRoomTx(tx *sql.Tx, roomID string) ([]string, error) {
 	ids, err := roomDeviceIDs(tx, roomID, "")
 	if err != nil {
 		return nil, err
@@ -793,6 +824,28 @@ func (db *DB) DeleteRoom(actorID, roomID string) ([]string, error) {
 		return nil, err
 	}
 	return ids, tx.Commit()
+}
+
+// DeleteRoomAsAdmin removes a room without requiring the room owner account
+// to remain available. It uses the same cleanup path as owner deletion.
+func (db *DB) DeleteRoomAsAdmin(roomID string) ([]string, error) {
+	tx, err := db.beginRoomWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var exists bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM rooms WHERE network_id = ?)`, strings.TrimSpace(roomID)).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, sql.ErrNoRows
+	}
+	ids, err := deleteRoomTx(tx, strings.TrimSpace(roomID))
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 func (db *DB) AssignRoomDeviceIP(actorID, roomID, deviceID, ip string) error {

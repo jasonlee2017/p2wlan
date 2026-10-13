@@ -23,7 +23,7 @@ export function SystemPage() {
           <div><dt>{tr("构建版本")}</dt><dd>{runtime.data.build_version}</dd></div>
           <div><dt>{tr("源码提交")}</dt><dd className="mono">{runtime.data.build_commit}</dd></div>
           <div><dt>{tr("启动时间")}</dt><dd>{formatDate(runtime.data.started_at)}</dd></div>
-          <div><dt>{tr("管理权限")}</dt><dd>{tr("read-only")}</dd></div>
+          <div><dt>{tr("管理权限")}</dt><dd>{runtime.data.admin_mode === 'control' ? tr('可管理账号和房间') : tr(runtime.data.admin_mode)}</dd></div>
         </dl>
       </Panel>
       <Panel title={tr("控制面状态")} subtitle={tr("不是业务数据面吞吐")}>

@@ -3,7 +3,7 @@
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
-  gtk
+  app_links_linux
   screen_retriever_linux
   tray_manager
   url_launcher_linux

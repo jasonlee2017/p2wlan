@@ -33,6 +33,24 @@ class WindowsProcessProbe {
   String? get processName => imagePath?.split(RegExp(r'[/\\]')).last;
 }
 
+class WindowsPidMarker {
+  const WindowsPidMarker(this.processId);
+
+  final int processId;
+
+  static WindowsPidMarker parse(String value) {
+    final processId = int.tryParse(value.trim());
+    if (processId == null || processId <= 0 || processId > 0xffffffff) {
+      throw const FormatException('Invalid Windows process marker');
+    }
+    return WindowsPidMarker(processId);
+  }
+
+  bool matches(WindowsProcessProbe process) =>
+      process.state == WindowsProcessState.running &&
+      process.processName?.toLowerCase() == 'p2wlan-daemon.exe';
+}
+
 /// Query the exact OS-returned PID without starting PowerShell or using WMI.
 /// Limited-information access works across the normal/elevated boundary;
 /// access denial stays an explicit failure, never a successful identity.

@@ -109,7 +109,7 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
         {runtimeTime && <small>{tr('快照截至：')}<time dateTime={new Date(runtime.dataUpdatedAt).toISOString()}>{runtimeTime}</time></small>}
         {!refreshInterval && <small>{tr('自动刷新已关闭，可手动刷新。')}</small>}
         <div className="sidebar-account-row">
-          <span className="sidebar-admin-copy"><strong>admin</strong><small>{tr('只读管理模式')}</small></span>
+          <span className="sidebar-admin-copy"><strong>admin</strong><small>{tr('管理员控制台')}</small></span>
           <div className="sidebar-footer-actions"><ThemeSwitch /><IconButton label={tr('刷新数据')} disabled={refreshing} icon={<RefreshCw size={16} className={refreshing ? 'spin' : ''} />} onClick={refresh} /><ConsolePreferences onOpen={() => setSidebarCollapsed(false)} onLogout={() => { clearAdminToken(); queryClient.clear(); onLogout() }} /></div>
         </div>
       </div>

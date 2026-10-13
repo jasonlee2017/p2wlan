@@ -113,6 +113,9 @@ class ControlApi {
     if (responseBody == null) {
       throw lastEndpointError ?? const ControlApiException('控制服务器请求失败');
     }
+    if (responseBody['activation_required'] == true) {
+      throw const ControlApiException('注册成功，等待服务器管理员激活后才能登录');
+    }
     final token = responseBody['token']?.toString() ?? '';
     if (token.isEmpty || responseBody['success'] == false) {
       throw ControlApiException(
@@ -724,6 +727,7 @@ String _zhAuthError(
 ]) {
   final raw = message?.trim() ?? '';
   final normalized = raw.toLowerCase();
+  if (normalized.contains('account pending') || normalized.contains('account_pending')) return '账号已注册，等待服务器管理员激活后才能连接';
   if (statusCode == 401) return unauthorizedMessage ?? '认证失败，请检查邮箱和密码';
   if (statusCode == 403) return '当前账号没有权限执行该操作';
   if (statusCode == 404) return '控制服务器暂不支持该接口，请先更新服务端';

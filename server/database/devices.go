@@ -309,9 +309,12 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 	}
 	defer tx.Rollback()
 
-	var room, member bool
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM rooms WHERE network_id = ?), EXISTS(SELECT 1 FROM network_memberships WHERE network_id = ? AND user_id = ?)`, networkID, networkID, userID).Scan(&room, &member); err != nil {
+	var room, member, active bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM rooms WHERE network_id = ?), EXISTS(SELECT 1 FROM network_memberships WHERE network_id = ? AND user_id = ?), COALESCE((SELECT active FROM rooms WHERE network_id = ?), 1)`, networkID, networkID, userID, networkID).Scan(&room, &member, &active); err != nil {
 		return nil, err
+	}
+	if room && !active {
+		return nil, ErrRoomAccess
 	}
 	if room && !member {
 		return nil, ErrRoomAccess
@@ -374,6 +377,9 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 					// facts that this same boot may already have published, but refresh
 					// its online lease.
 					now := time.Now().Unix()
+					if err := touchDevicePresenceTx(tx, existing.ID, now, existing.LastSeen); err != nil {
+						return nil, err
+					}
 					if _, err := tx.Exec(`UPDATE devices SET last_seen = ?, online = 1 WHERE id = ?`, now, existing.ID); err != nil {
 						return nil, err
 					}
@@ -410,6 +416,9 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 		registrationIncarnation := existing.RegistrationIncarnation
 		if attempt.EnforceIncarnation && attempt.Incarnation != nil && *attempt.Incarnation > 0 {
 			registrationIncarnation = *attempt.Incarnation
+		}
+		if err := startDevicePresenceTx(tx, existing.ID, now, existing.LastSeen); err != nil {
+			return nil, err
 		}
 		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, virtual_ip = ?, app_version = CASE WHEN ? != '' THEN ? ELSE app_version END, endpoint = '', nat_type = 'unknown', relay_rtt_ms = NULL, last_seen = ?, online = 1, ed25519_public_key = CASE WHEN ? != '' THEN ? ELSE ed25519_public_key END, registration_seq = COALESCE(registration_seq, 1) + 1, registration_incarnation = ?, hh2_pair_nomination = ?, hh2_plan_v2 = ? WHERE id = ?`,
 			deviceName, platform, virtualIP, appVersion, appVersion, now, ed25519PublicKey, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2, existing.ID)
@@ -471,6 +480,9 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?, ?)`,
 		id, userID, networkID, publicKey, deviceName, platform, virtualIP, appVersion, now, now, ed25519PublicKey, registrationIncarnation, capabilities.HH2PairNomination, capabilities.HH2PlanV2)
 	if err != nil {
+		return nil, err
+	}
+	if err := ensureDevicePresenceTx(tx, id, now, true); err != nil {
 		return nil, err
 	}
 
@@ -662,8 +674,18 @@ func (db *DB) listDevices(fromClause string, args ...interface{}) ([]Device, err
 // MarkStaleDevicesOffline sets online=0 for devices whose last_seen is older than ttlSeconds.
 func (db *DB) MarkStaleDevicesOffline(ttlSeconds int64) error {
 	cutoff := time.Now().Unix() - ttlSeconds
-	_, err := db.Exec(`UPDATE devices SET online = 0 WHERE online = 1 AND last_seen > 0 AND last_seen < ?`, cutoff)
-	return err
+	tx, err := db.beginRoomWrite()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := markStaleDevicePresenceTx(tx, cutoff); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE devices SET online = 0 WHERE online = 1 AND last_seen > 0 AND last_seen < ?`, cutoff); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (db *DB) updateDeviceEndpointInternal(deviceID, endpoint, natType string, relayRTTMS *int64, isHeartbeat bool, expectedRegistrationSequence *int64) error {
@@ -675,9 +697,10 @@ func (db *DB) updateDeviceEndpointInternal(deviceID, endpoint, natType string, r
 
 	now := time.Now().Unix()
 	var currentEndpoint, currentNAT string
+	var currentLastSeen int64
 	var currentRegSeq, registrationIncarnation int64
-	row := tx.QueryRow(`SELECT COALESCE(endpoint, ''), COALESCE(nat_type, ''), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0) FROM devices WHERE id = ?`, deviceID)
-	if err := row.Scan(&currentEndpoint, &currentNAT, &currentRegSeq, &registrationIncarnation); err != nil {
+	row := tx.QueryRow(`SELECT COALESCE(endpoint, ''), COALESCE(nat_type, ''), COALESCE(last_seen, 0), COALESCE(registration_seq, 1), COALESCE(registration_incarnation, 0) FROM devices WHERE id = ?`, deviceID)
+	if err := row.Scan(&currentEndpoint, &currentNAT, &currentLastSeen, &currentRegSeq, &registrationIncarnation); err != nil {
 		return err
 	}
 	if expectedRegistrationSequence != nil && registrationIncarnation > 0 {
@@ -711,6 +734,11 @@ func (db *DB) updateDeviceEndpointInternal(deviceID, endpoint, natType string, r
 				relayRTTMS, deviceID)
 		}
 	}
+	if isHeartbeat {
+		if err := touchDevicePresenceTx(tx, deviceID, now, currentLastSeen); err != nil {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -735,8 +763,22 @@ func (db *DB) UpdateDeviceEndpointForRegistrationSession(deviceID string, regist
 // registration or changing its last real heartbeat. It is used by a graceful
 // daemon shutdown; abnormal exits still converge through DeviceOnlineTTL.
 func (db *DB) ReleaseDevicePresence(deviceID string) error {
-	_, err := db.Exec(`UPDATE devices SET online = 0 WHERE id = ?`, deviceID)
-	return err
+	tx, err := db.beginRoomWrite()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRow(`SELECT 1 FROM devices WHERE id = ?`, deviceID).Scan(&exists); err != nil {
+		return err
+	}
+	if err := closeDevicePresenceTx(tx, deviceID, time.Now().Unix()); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE devices SET online = 0 WHERE id = ?`, deviceID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ReleaseDevicePresenceForRegistrationSession marks a device offline only if
@@ -760,6 +802,9 @@ func (db *DB) ReleaseDevicePresenceForRegistrationSession(deviceID string, regis
 			CurrentSequence:    currentRegSeq,
 			CurrentIncarnation: registrationIncarnation,
 		}
+	}
+	if err := closeDevicePresenceTx(tx, deviceID, time.Now().Unix()); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(`UPDATE devices SET online = 0 WHERE id = ?`, deviceID); err != nil {
 		return err

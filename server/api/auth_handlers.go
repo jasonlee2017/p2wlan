@@ -3,9 +3,11 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"github.com/yhan-sun/p2wlan/server/database"
 	"net/http"
 	"strings"
+
+	"github.com/yhan-sun/p2wlan/server/auth"
+	"github.com/yhan-sun/p2wlan/server/database"
 )
 
 // ---- Auth endpoints ----
@@ -48,10 +50,10 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
+		"token":   token,
 		"user":    user,
-		"activation_required": true,
 	})
 }
 
@@ -77,16 +79,16 @@ func (s *Server) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, user, err := s.auth.Register(req.Email, req.Password)
+	_, user, err := s.auth.RegisterPending(req.Email, req.Password)
 	if err != nil {
 		http.Error(w, `{"error":"registration failed"}`, http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
 		"success": true,
-		"token":   token,
 		"user":    user,
+		"activation_required": true,
 	})
 }
 

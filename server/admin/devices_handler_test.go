@@ -126,7 +126,7 @@ func TestAdminDeviceCursorDoesNotGrantAdminAuthority(t *testing.T) {
 			t.Fatalf("non-admin credential gained device access: %d %s", response.Code, response.Body)
 		}
 	}
-	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
 		request := httptest.NewRequest(method, "/admin/api/v1/devices/cursor", nil)
 		request.Header.Set("Authorization", "Bearer "+token)
 		response := httptest.NewRecorder()
@@ -134,6 +134,15 @@ func TestAdminDeviceCursorDoesNotGrantAdminAuthority(t *testing.T) {
 		if response.Code != http.StatusMethodNotAllowed {
 			t.Fatalf("write method %s accepted: %d", method, response.Code)
 		}
+	}
+	// DELETE is intentionally handled by the admin device resource route;
+	// the cursor-shaped ID is simply absent from this fixture.
+	request := httptest.NewRequest(http.MethodDelete, "/admin/api/v1/devices/cursor", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("missing admin device delete should return 404, got %d", response.Code)
 	}
 	disabled := http.NewServeMux()
 	testServer(t, "").RegisterRoutes(disabled)

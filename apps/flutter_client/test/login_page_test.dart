@@ -14,9 +14,25 @@ import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
+import 'package:p2wlan_flutter_client/features/auth/login_errors.dart';
 import 'package:p2wlan_flutter_client/features/auth/login_page.dart';
 
 void main() {
+  test('pending account responses use the activation-required category', () {
+    expect(
+      loginErrorKindOf(
+        const ControlApiException('注册成功，等待服务器管理员激活后才能登录'),
+      ),
+      LoginErrorKind.registrationPending,
+    );
+    expect(
+      loginErrorKindOf(
+        const ControlApiException('账号已注册，等待服务器管理员激活后才能连接'),
+      ),
+      LoginErrorKind.registrationPending,
+    );
+  });
+
   testWidgets('Login page uses dark surfaces in dark theme', (tester) async {
     final stores = (await tester.runAsync(_makeStores))!;
     addTearDown(stores.dispose);
@@ -237,6 +253,38 @@ void main() {
     expect(find.text('Sign in failed'), findsOneWidget);
     expect(find.text('Incorrect email or password.'), findsOneWidget);
     expect(find.textContaining('邮箱'), findsNothing);
+  });
+
+  testWidgets('registration pending explains that administrator activation is required', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(_makeStores))!;
+    addTearDown(stores.dispose);
+    final fake = _FakeControlApi(
+      error: const ControlApiException('注册成功，等待服务器管理员激活后才能登录'),
+    );
+
+    await _pumpLogin(
+      tester,
+      stores,
+      controlApi: fake,
+      controlServer: 'https://control.example.com',
+      languageCode: 'zh-Hans',
+    );
+    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
+    await tester.tap(find.text('没有账号？创建账号'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.tap(find.text('创建账号'));
+    await _waitFor(tester, () => fake.authenticateCalls == 1);
+    await tester.pumpAndSettle();
+
+    expect(find.text('注册成功'), findsOneWidget);
+    expect(
+      find.text('账号已创建，请等待服务器管理员激活后再登录。'),
+      findsOneWidget,
+    );
+    expect(find.text('注册失败，请稍后重试。'), findsNothing);
   });
 
   testWidgets('network failures map to reachability message', (tester) async {

@@ -1,0 +1,27 @@
+P2WLAN Windows server update
+
+Target install root: D:\Softwares\p2wlan
+
+1. Copy exactly one ZIP and its matching .sha256 file to the same directory on the server.
+2. Run PowerShell as Administrator and execute:
+
+   $archives = @(Get-ChildItem -LiteralPath (Get-Location) -Filter 'p2wlan-server-windows-amd64*.zip' -File)
+   if ($archives.Count -ne 1) { throw "Expected exactly one Windows server ZIP" }
+   $Archive = $archives[0].FullName
+   $expected = ((Get-Content -LiteralPath "$Archive.sha256" | Select-Object -First 1) -split '\s+')[0].ToLowerInvariant()
+   $actual = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+   if ($actual -ne $expected) { throw "ZIP SHA256 mismatch" }
+   Expand-Archive -LiteralPath $Archive -DestinationPath (Get-Location) -Force
+   Set-ExecutionPolicy -Scope Process Bypass -Force
+   & '.\Update-P2WlanServer-D-Softwares.ps1' -Archive $Archive -ConfigDir 'C:\ProgramData\P2WLAN\config' -Start
+
+The wrapper uses D:\Softwares\p2wlan as the install root and detects the
+configuration and data directories. If the server uses custom locations,
+pass -ConfigDir and -DataDir explicitly.
+
+The updater keeps a database/config backup under the selected data directory
+and keeps the previous binaries under D:\Softwares\p2wlan\previous.
+
+Rollback after a successful update:
+
+   .\Update-P2WlanServer-D-Softwares.ps1 -Rollback -Start

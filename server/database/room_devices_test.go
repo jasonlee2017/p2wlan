@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"errors"
 	"testing"
 )
@@ -187,5 +188,69 @@ func TestRoomOwnerAndExitAreAccountScoped(t *testing.T) {
 	}
 	if _, err := db.GetDevice(otherOwner.ID); err != nil {
 		t.Fatal("exit removed another account device", err)
+	}
+}
+
+func TestDeleteAccountRemovesRoomDeviceAccessInRoomsItDoesNotOwn(t *testing.T) {
+	db := roomTestDB(t)
+	owner := roomTestUser(t, db, "delete-account-owner")
+	member := roomTestUser(t, db, "delete-account-member")
+	room := roomTestRoom(t, db, owner)
+	if _, err := db.JoinRoom(member, room.Code, "safe-password", ""); err != nil {
+		t.Fatal(err)
+	}
+	device := roomTestDevice(t, db, member, room.ID, "delete-account-device")
+	if _, err := db.RequestRoomDevice(member, room.ID, device.PublicKey, device.DeviceName, device.Platform, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.DeleteAccount(member); err != nil {
+		t.Fatalf("DeleteAccount: %v", err)
+	}
+	if _, err := db.GetUserByID(member); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted account still exists: %v", err)
+	}
+	var accessCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM room_device_access WHERE user_id = ?`, member).Scan(&accessCount); err != nil {
+		t.Fatal(err)
+	}
+	if accessCount != 0 {
+		t.Fatalf("room device access survived account deletion: %d", accessCount)
+	}
+	if _, err := db.GetRoom(owner, room.ID); err != nil {
+		t.Fatalf("member deletion removed another account's room: %v", err)
+	}
+}
+
+func TestDeleteRoomAsAdminCleansDevicesAccessAndSubnet(t *testing.T) {
+	db := roomTestDB(t)
+	owner := roomTestUser(t, db, "delete-room-owner")
+	member := roomTestUser(t, db, "delete-room-member")
+	room := roomTestRoom(t, db, owner)
+	if _, err := db.JoinRoom(member, room.Code, "safe-password", ""); err != nil {
+		t.Fatal(err)
+	}
+	device := roomTestDevice(t, db, member, room.ID, "delete-room-device")
+	if _, err := db.RequestRoomDevice(member, room.ID, device.PublicKey, device.DeviceName, device.Platform, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DeleteRoomAsAdmin(room.ID); err != nil {
+		t.Fatalf("DeleteRoomAsAdmin: %v", err)
+	}
+	if _, err := db.GetRoom(owner, room.ID); !errors.Is(err, ErrRoomAccess) {
+		t.Fatalf("deleted room is still visible: %v", err)
+	}
+	if _, err := db.GetDevice(device.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("room device survived deletion: %v", err)
+	}
+	var accessCount, subnetCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM room_device_access WHERE network_id = ?`, room.ID).Scan(&accessCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM room_subnets WHERE network_id = ?`, room.ID).Scan(&subnetCount); err != nil {
+		t.Fatal(err)
+	}
+	if accessCount != 0 || subnetCount != 0 {
+		t.Fatalf("room cleanup incomplete: access=%d subnet=%d", accessCount, subnetCount)
 	}
 }

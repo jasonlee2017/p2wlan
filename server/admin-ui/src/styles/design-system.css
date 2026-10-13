@@ -1739,6 +1739,83 @@ body {
   padding: 0 9px;
 }
 
+.activation-action.active {
+  min-width: 84px;
+  color: var(--console-success);
+  border-color: color-mix(in srgb, var(--console-success) 34%, var(--console-border-strong));
+  background: var(--console-success-soft);
+}
+
+.activation-action.active:hover {
+  border-color: color-mix(in srgb, var(--console-success) 52%, var(--console-border-strong));
+  background: color-mix(in srgb, var(--console-success-soft) 78%, var(--console-surface-solid));
+}
+
+.activation-action.pending {
+  min-width: 84px;
+  color: var(--console-warning);
+  border-color: color-mix(in srgb, var(--console-warning) 34%, var(--console-border-strong));
+  background: var(--console-warning-soft);
+}
+
+.activation-action.pending:hover {
+  border-color: color-mix(in srgb, var(--console-warning) 52%, var(--console-border-strong));
+  background: color-mix(in srgb, var(--console-warning-soft) 78%, var(--console-surface-solid));
+}
+
+/* Dark surfaces need explicit status contrast; muted shared tokens otherwise
+ * make an active control look like the neutral secondary button. */
+:root[data-theme="dark"] .activation-action.active {
+  color: #7be7b8;
+  border-color: rgba(88, 218, 157, .62);
+  background: rgba(46, 173, 115, .18);
+}
+
+:root[data-theme="dark"] .activation-action.active:hover {
+  color: #a0f2cd;
+  border-color: rgba(123, 231, 184, .84);
+  background: rgba(46, 173, 115, .28);
+}
+
+:root[data-theme="dark"] .activation-action.pending {
+  color: #f2bd70;
+  border-color: rgba(230, 162, 76, .62);
+  background: rgba(190, 119, 35, .18);
+}
+
+:root[data-theme="dark"] .activation-action.pending:hover {
+  color: #ffd394;
+  border-color: rgba(242, 189, 112, .84);
+  background: rgba(190, 119, 35, .28);
+}
+
+/* Keep activation state stronger than the shared dark secondary-button rule.
+ * These buttons are status controls, so their semantic color must survive
+ * theme and bundle ordering in the embedded console. */
+:root[data-theme="dark"] button.button.activation-action.active {
+  color: #9af0c8;
+  border-color: rgba(98, 218, 157, .72);
+  background: rgba(46, 173, 115, .24);
+}
+
+:root[data-theme="dark"] button.button.activation-action.active:hover {
+  color: #c0f8dd;
+  border-color: rgba(154, 240, 200, .9);
+  background: rgba(46, 173, 115, .36);
+}
+
+:root[data-theme="dark"] button.button.activation-action.pending {
+  color: #ffd08c;
+  border-color: rgba(230, 162, 76, .72);
+  background: rgba(190, 119, 35, .24);
+}
+
+:root[data-theme="dark"] button.button.activation-action.pending:hover {
+  color: #ffe1af;
+  border-color: rgba(255, 208, 140, .9);
+  background: rgba(190, 119, 35, .36);
+}
+
 .text-link {
   gap: 4px;
   color: var(--console-text-soft);

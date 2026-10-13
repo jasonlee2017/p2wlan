@@ -8,14 +8,14 @@
 - p2wlan-relay
 - p2wlan-config
 - p2wlan-db
-- p2wlan-server、install-server.sh、deploy-server.sh
+- p2wlan-server、install-server.sh、deploy-server.sh；Windows 包另含 `Update-P2WlanServer.ps1`
 - BUILD-METADATA.txt 和 SHA256SUMS
 
 普通部署不需要在服务器上安装 Go、Node.js 或从源码构建。Linux systemd manager 的安装、升级和 doctor 需要 Python 3 标准库，以固定文件句柄检查和准备私有日志存储；该检查代码随同一归档的 manager 发布，不在线下载。管理台使用 React/TypeScript/Vite 开发，但 Vite 只在开发和 CI 构建阶段运行；生成的静态产物由 `go:embed` 编译进 `p2wlan-control`，发布后仍然是单一 Control 进程。
 
 ## 支持与验证范围
 
-固定 `server-vX.Y.Z` 归档的公开部署契约是 Linux + systemd。仓库 CI 对服务端做分层验证：
+固定 `server-vX.Y.Z` 归档提供 Linux 和 Windows x64 两种原生部署包。Linux 使用 systemd；Windows 使用 PowerShell 管理脚本。仓库 CI 对服务端做分层验证：
 
 | 运行形态 | 自动验证范围 | 边界 |
 | --- | --- | --- |
@@ -23,7 +23,7 @@
 | 管理台前端 | 固定 Node 版本安装依赖，执行 TypeScript typecheck、Vite production build，并校验构建后的静态产物；服务端发布任务会在 Go 编译前再次构建管理台 | Node 只属于构建链，不进入生产服务器运行时 |
 | Linux 静态服务端二进制 | Ubuntu 20.04 容器验证 `CGO_ENABLED=0` 产物没有动态 loader，并能执行 `--version` | 只证明基础 loader 兼容，不等于 Ubuntu 20.04 上完整 systemd、网络和业务链路已验收 |
 | Docker Compose | Ubuntu 22.04 runner 构建实际 Debian bookworm 镜像、启动 Control/Relay、检查 readyz，并验证 SQLite 数据卷重启持久性 | 生产部署仍应使用固定镜像摘要并自行完成公网、TLS 和恢复演练 |
-| Windows 服务端代码 | `windows-latest` 执行 Go vet/tests 和真实 Control/Relay 双进程 smoke | 当前固定 `server-vX.Y.Z` 发布归档不是 Windows 安装包，因此 Windows 不属于公开的固定归档部署路径 |
+| Windows 原生服务端 | `windows-latest` 执行 Go vet/tests、真实 Control/Relay 双进程 smoke，并生成 Windows x64 归档 | 归档提供 PowerShell 更新、备份、启动、健康检查和回滚；公网 HTTPS/WSS、证书和长期运行仍需在目标主机验收 |
 
 这表示 Ubuntu 20.04 会验证发布形态的静态 Control/Relay 二进制可以启动并报告版本，但当前 CI 不声明 Ubuntu 20.04 的完整 systemd 管理、真实网络、TLS、升级恢复和长期运行已经端到端验收。未列入完整验证矩阵的 Linux 发行版不能仅凭“能启动二进制”视为正式兼容；正式部署优先使用已验证的 Ubuntu 22.04 或固定镜像，并自行核对 systemd、文件权限、反向代理、TLS、数据库和内核网络能力。
 
@@ -38,6 +38,22 @@
 也可以让新机器的安装脚本按明确版本下载并校验归档：
 
     sudo ./install-server.sh --version server-vX.Y.Z --role all
+
+## Windows x64 部署
+
+Windows 发布资产为 `p2wlan-server-windows-amd64.zip` 和同名 `.sha256`。仓库本地固定目录为 `release/server/windows-amd64/<yyyy-MM-dd>/<server-version>/`；客户端 Windows 固定目录为 `release/client/windows/<yyyy-MM-dd>/<client-version>/`。解压后的服务端包包含四个服务端程序、`BUILD-METADATA.txt`、`SHA256SUMS`、`Update-P2WlanServer.ps1` 和 `Run-P2WlanRole.ps1`。Windows 主机不需要安装 Go 或 Node.js；需要管理员 PowerShell、`Expand-Archive` 和现有部署目录中的 `control.env`、`relay.env`。
+
+默认目录为 `%ProgramData%\P2Wlan\server`、`%ProgramData%\P2Wlan\config` 和 `%ProgramData%\P2Wlan\data`。已有 Windows 部署更新时，在解压目录打开管理员 PowerShell：
+
+    .\Update-P2WlanServer.ps1 -Archive .\p2wlan-server-windows-amd64.zip -Start
+
+脚本会校验 `.sha256`、检查归档版本和源码提交、停止当前 Control/Relay（包括名为 `P2WLAN-Control` 和 `P2WLAN-Relay` 的 Windows 服务）、使用 `p2wlan-db.exe` 创建一致性 SQLite 快照、保留配置、切换版本并检查 `/health`。检测到现有 NSSM 服务时，服务仍使用原有参数，但会通过 `Run-P2WlanRole.ps1` 从 `current` 发布目录启动新版本。不传 `-Start` 时只更新而不启动。
+
+回滚到更新前版本：
+
+    .\Update-P2WlanServer.ps1 -Rollback -Start
+
+Windows 归档不注册 Windows 服务，也不替代 IIS、Caddy 或其他反向代理。需要开机自动运行时，应使用经审核的任务计划程序或服务托管方式，并让托管程序调用归档中的两个可执行文件；Control 的 `/admin/` 仍应只通过可信 HTTPS/WSS 入口暴露。
 
 安装器不会再从 main 或其他可变分支补取 manager；缺少同归档中的 manager 会直接失败。
 
@@ -66,7 +82,7 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 支持日志使用独立的私有持久目录。标准安装显式设置 `LOG_UPLOAD_DIR` 为数据目录下的 `log-uploads`，不依赖进程工作目录；受管理目录由 `p2wlan` 拥有并限制为 `0700`。自定义值由部署者创建并检查服务账户和 systemd 的访问权限；Compose 自定义路径还须位于可写的持久挂载内。不要把支持日志放进发布目录或公共下载目录。
 
-管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；删除 `CONTROL_ADMIN_TOKEN` 并重启 Control 即可完全关闭管理面，此时 `/admin` 与 `/admin/*` 对任意 HTTP 方法都返回 404。当前管理台只读，不提供删除设备、修改房间或重启服务等写操作。
+管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；删除 `CONTROL_ADMIN_TOKEN` 并重启 Control 即可完全关闭管理面，此时 `/admin` 与 `/admin/*` 对任意 HTTP 方法都返回 404。管理台可激活或停用账号和房间，也可在二次确认后永久删除账号、房间和设备；删除房间或设备会撤销相关凭据、清理连接状态并释放房间虚拟 IP。管理台不负责重启服务。
 
 管理台源码位于 `server/admin-ui/`，`src/features/` 按功能组织页面，`src/layout/` 管理外壳，`src/components/ui/` 与 `src/shared/` 复用界面和交互，`src/styles/app.css` 是应用样式入口；CI 按锁文件执行 `npm ci` 并重新构建，再与仓库中已提交的 `server/admin/web/` 逐字节比对，因此源码改动后忘记重新构建会被 CI 拦下。服务端 tag / staging 构建也会在 `go build` 前重新执行 typecheck 和 production build，再由 Go 将生成目录嵌入 Control。这保证发布归档和本地 `go build` 都不会携带过期 UI，同时服务端安装和升级路径仍然只围绕原有服务端归档，不引入第二套前端发布流程。
 

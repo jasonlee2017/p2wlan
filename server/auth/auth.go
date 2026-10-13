@@ -68,12 +68,27 @@ func (s *Service) Login(identifier, password string) (string, *database.User, er
 
 // Register creates a new user account.
 func (s *Service) Register(email, password string) (string, *database.User, error) {
+	return s.register(email, password, true)
+}
+
+// RegisterPending creates an account that cannot authenticate until an
+// administrator activates it. The HTTP registration endpoint uses this path.
+func (s *Service) RegisterPending(email, password string) (string, *database.User, error) {
+	return s.register(email, password, false)
+}
+
+func (s *Service) register(email, password string, active bool) (string, *database.User, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return "", nil, err
 	}
 
-	user, err := s.db.CreateUser(email, string(hash))
+	var user *database.User
+	if active {
+		user, err = s.db.CreateUser(email, string(hash))
+	} else {
+		user, err = s.db.CreatePendingUser(email, string(hash))
+	}
 	if err != nil {
 		return "", nil, err
 	}
@@ -103,8 +118,10 @@ func (s *Service) ValidateToken(tokenStr string) (*Claims, error) {
 		return nil, ErrInvalidToken
 	}
 
-	active, err := s.db.IsAccountActive(claims.UserID)
-	if err != nil || !active { return nil, ErrAccountPending }
+	if s.db != nil {
+		active, err := s.db.IsAccountActive(claims.UserID)
+		if err != nil || !active { return nil, ErrAccountPending }
+	}
 	return claims, nil
 }
 
@@ -152,6 +169,10 @@ func (s *Service) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		claims, err := s.ValidateToken(tokenStr)
 		if err != nil {
+			if errors.Is(err, ErrAccountPending) {
+				http.Error(w, `{"error":"account pending administrator activation","error_code":"account_pending"}`, http.StatusForbidden)
+				return
+			}
 			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 			return
 		}
@@ -240,6 +261,10 @@ func RequireAnyAuth(authService *Service, db interface {
 			if err == nil {
 				ctx := context.WithValue(r.Context(), UserClaimsKey, userClaims)
 				next(w, r.WithContext(ctx))
+				return
+			}
+			if errors.Is(err, ErrAccountPending) {
+				http.Error(w, `{"error":"account pending administrator activation","error_code":"account_pending"}`, http.StatusForbidden)
 				return
 			}
 

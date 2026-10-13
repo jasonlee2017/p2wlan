@@ -327,7 +327,7 @@ Credential boundaries and security limitations are documented in [SECURITY.md](S
 
 ## Developers
 
-Flutter development and releases use **Flutter 3.47.2 / Dart 3.13.2**. The repository-root `.fvmrc` is the version source for local FVM, CI, and release workflows.
+Flutter development and releases use **Flutter 3.47.7 / Dart 3.13.5**. The repository-root `.fvmrc` is the version source for local FVM, CI, and release workflows.
 
 Repository structure:
 

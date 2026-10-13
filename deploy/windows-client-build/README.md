@@ -6,7 +6,7 @@
 
 在打包电脑安装并加入 PATH：
 
-- Flutter 3.47.2，Dart 3.13.2；仓库根目录的 `.fvmrc` 是版本依据；
+- Flutter 3.47.7，Dart 3.13.5；仓库根目录的 `.fvmrc` 是版本依据；
 - Rust stable 和 MSVC 工具链；
 - Git for Windows，提供 `bash.exe`；
 - Python 3；
@@ -39,9 +39,12 @@ cd p2wlan
 输出目录：
 
 ```text
-dist-release\windows-client-local\p2wlan-windows-x64-portable\
-dist-release\windows-client-local\p2wlan-windows-x64-portable.zip
+release\client\windows\<yyyy-MM-dd>\<客户端版本>\p2wlan-windows-x64-portable\
+release\client\windows\<yyyy-MM-dd>\<客户端版本>\p2wlan-windows-x64-portable.zip
+release\client\windows\<yyyy-MM-dd>\<客户端版本>\p2wlan-windows-x64-portable.zip.sha256
 ```
+
+`<yyyy-MM-dd>` 默认使用打包机本地日期，`<客户端版本>` 来自 `pubspec.yaml`。需要重现某一天的目录时可显式传入 `-ReleaseDate 2026-10-11`；也可以用 `-OutputDirectory` 指定临时目录，但交付包应复制回上述固定目录。
 
 portable 目录或 ZIP 中的 `p2wlan_flutter_client.exe` 可以直接用于测试。客户端和 daemon 必须来自同一次构建，不能把旧版本的 `p2wlan-daemon.exe` 单独替换进去。
 
@@ -56,7 +59,8 @@ portable 目录或 ZIP 中的 `p2wlan_flutter_client.exe` 可以直接用于测�
 额外输出：
 
 ```text
-dist-release\windows-client-local\p2wlan-windows-x64-setup.exe
+release\client\windows\<yyyy-MM-dd>\<客户端版本>\p2wlan-windows-x64-setup.exe
+release\client\windows\<yyyy-MM-dd>\<客户端版本>\p2wlan-windows-x64-setup.exe.sha256
 ```
 
 安装程序使用当前用户目录，不需要管理员权限。首次连接房间时，客户端可能请求管理员权限，以便创建 Wintun 网卡和安装路由。

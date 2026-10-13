@@ -28,6 +28,8 @@ class FakeRuntime implements RoomRuntime {
   int stops = 0;
   bool closed = false;
   bool present = false;
+  bool failExists = false;
+  Completer<void>? existsGate;
   bool failStop = false;
   bool failStart = false;
   bool failStatus = false;
@@ -36,7 +38,11 @@ class FakeRuntime implements RoomRuntime {
   Completer<void>? stopGate;
 
   @override
-  Future<bool> exists() async => present;
+  Future<bool> exists() async {
+    await existsGate?.future;
+    if (failExists) throw StateError('process query failed');
+    return present;
+  }
 
   @override
   Future<DaemonCommandResult> start() async {
@@ -250,6 +256,89 @@ void main() {
   });
 
   test(
+    'connect exposes startup progress while the daemon is launching',
+    () async {
+      final gate = Completer<void>();
+      configure = (runtime) => runtime.startGate = gate;
+      final connecting = manager.connect(room(1));
+      await Future<void>.delayed(Duration.zero);
+      expect(manager.session(room(1).id)!.message, '正在检查本机路由并启动房间服务');
+      gate.complete();
+      expect((await connecting).ok, isTrue);
+      expect(manager.session(room(1).id)!.message, isNull);
+    },
+  );
+
+  test(
+    'keeps the last valid room snapshot during a transient diagnostics failure',
+    () async {
+      FakeRuntime? transientRuntime;
+      final transientManager = ParallelRooms(
+        readSettings: () => settings,
+        supported: true,
+        refreshInterval: const Duration(milliseconds: 1),
+        runtimeFactory: (plan) {
+          final runtime = FakeRuntime(plan)..present = true;
+          transientRuntime = runtime;
+          return runtime;
+        },
+      );
+      void listener() {}
+      transientManager.addListener(listener);
+      addTearDown(() async {
+        transientManager.removeListener(listener);
+        await transientManager.stopAll();
+        transientManager.dispose();
+      });
+
+      expect((await transientManager.connect(room(1))).ok, isTrue);
+      final session = transientManager.session(room(1).id)!;
+      final snapshot = session.snapshot;
+      expect(snapshot, isNotNull);
+      transientRuntime!.failStatus = true;
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(session.phase, RoomConnectionPhase.running);
+      expect(session.snapshot, same(snapshot));
+      expect(session.message, '房间状态同步暂时失败，正在重试');
+
+      transientRuntime!.failStatus = false;
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(session.phase, RoomConnectionPhase.running);
+      expect(session.message, isNull);
+    },
+  );
+
+  test('cleans a running room session after its daemon exits', () async {
+    FakeRuntime? runtime;
+    final observed = ParallelRooms(
+      readSettings: () => settings,
+      supported: true,
+      refreshInterval: const Duration(milliseconds: 1),
+      runtimeFactory: (plan) {
+        runtime = FakeRuntime(plan)..present = true;
+        return runtime!;
+      },
+    );
+    void listener() {}
+    observed.addListener(listener);
+    addTearDown(() async {
+      observed.removeListener(listener);
+      await observed.stopAll();
+      observed.dispose();
+    });
+
+    expect((await observed.connect(room(1))).ok, isTrue);
+    runtime!.present = false;
+    runtime!.failStatus = true;
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+
+    expect(observed.session(room(1).id), isNull);
+    expect(observed.activeConnections, 0);
+    expect(observed.occupiedConnectionSlots, 0);
+    expect(runtime!.stops, 1);
+  });
+
+  test(
     'account change cancels start and keeps old credentials out of new room',
     () async {
       final gate = Completer<void>();
@@ -322,7 +411,26 @@ void main() {
     configure = (runtime) => runtime.present = true;
     await manager.recover(room(1));
     expect(manager.session(room(1).id)!.phase, RoomConnectionPhase.running);
+    expect(manager.activeConnections, 1);
     expect(runtimes[room(1).id]!.starts, 0);
+  });
+
+  test('unverified recovered room is retained for cleanup but not counted connected', () async {
+    configure = (runtime) => runtime.failExists = true;
+    await manager.recover(room(1));
+
+    final session = manager.session(room(1).id)!;
+    expect(session.phase, RoomConnectionPhase.failed);
+    expect(session.message, '无法确认房间进程状态，请重试断开');
+    expect(manager.activeConnections, 0);
+    expect(manager.occupiedConnectionSlots, 1);
+    expect(manager.hasSessions, isTrue);
+
+    expect((await manager.disconnect(room(1).id)).ok, isTrue);
+    expect(manager.sessions, isEmpty);
+    expect(manager.activeConnections, 0);
+    expect(manager.occupiedConnectionSlots, 0);
+    expect(runtimes[room(1).id]!.stops, 1);
   });
 
   test(
@@ -332,6 +440,20 @@ void main() {
       expect(manager.sessions, isEmpty);
       expect(runtimes[room(1).id]!.starts, 0);
       expect(runtimes[room(1).id]!.closed, isTrue);
+    },
+  );
+
+  test(
+    'recovery does not publish a session before process identity is confirmed',
+    () async {
+      final gate = Completer<void>();
+      configure = (runtime) => runtime.existsGate = gate;
+      final recovering = manager.recover(room(1));
+      await Future<void>.delayed(Duration.zero);
+      expect(manager.session(room(1).id), isNull);
+      gate.complete();
+      await recovering;
+      expect(manager.session(room(1).id), isNull);
     },
   );
 

@@ -32,6 +32,10 @@ enum LoginErrorKind {
   /// Registration-specific failures.
   registrationFailed,
 
+  /// Registration was accepted but the account still needs administrator
+  /// activation before it can sign in.
+  registrationPending,
+
   /// Anything that cannot be classified safely.
   unknown,
 }
@@ -86,6 +90,10 @@ LoginErrorKind _kindForControlMessage(String message) {
   }
   if (message.startsWith('注册失败')) {
     return LoginErrorKind.registrationFailed;
+  }
+  if (message.startsWith('注册成功，等待服务器管理员激活后才能登录') ||
+      message.startsWith('账号已注册，等待服务器管理员激活后才能连接')) {
+    return LoginErrorKind.registrationPending;
   }
   if (message.startsWith('邮箱') ||
       message.startsWith('密码') ||

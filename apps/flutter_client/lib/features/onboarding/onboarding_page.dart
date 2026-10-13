@@ -1,8 +1,4 @@
-import 'dart:io';
-
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:window_manager/window_manager.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
@@ -12,7 +8,6 @@ import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/permission_copy.dart';
-import '../../shared/widgets/windows_window_controls.dart';
 import 'onboarding_model.dart';
 
 /// Resumable first-run / node-setup flow for a local P2WLAN node.
@@ -189,14 +184,6 @@ class _OnboardingPageState extends State<OnboardingPage> {
         return Scaffold(
           body: Stack(
             children: [
-              if (_usesWindowsOnboardingChrome)
-                const Positioned(
-                  top: 0,
-                  left: 0,
-                  right: WindowsWindowControls.width,
-                  height: 56,
-                  child: DragToMoveArea(child: SizedBox.expand()),
-                ),
               SafeArea(
                 child: Center(
                   child: SingleChildScrollView(
@@ -281,7 +268,6 @@ class _OnboardingPageState extends State<OnboardingPage> {
   }
 }
 
-bool get _usesWindowsOnboardingChrome => !kIsWeb && Platform.isWindows;
 
 class _OnboardingStepper extends StatelessWidget {
   const _OnboardingStepper({

@@ -90,7 +90,7 @@ async fn authenticate(path: &Path, args: AuthArgs, register: bool) -> Result<(),
     let token = body
         .token
         .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| "控制服务器没有返回有效 token".to_string())?;
+        .ok_or_else(|| if body.activation_required == Some(true) { "注册成功，等待服务器管理员激活后才能登录".to_string() } else { "控制服务器没有返回有效 token".to_string() })?;
 
     let mut config = match existing {
         Some(config) => config,

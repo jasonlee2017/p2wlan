@@ -20,6 +20,7 @@ type AdminAccountSummary struct {
 	RoomCount     int    `json:"room_count"`
 	LastSeen      int64  `json:"last_seen"`
 	CreatedAt     int64  `json:"created_at"`
+	Active        bool   `json:"active"`
 }
 
 type AdminAccountPage struct {
@@ -125,7 +126,8 @@ func adminAccountColumns() string {
 		(SELECT COUNT(*) FROM network_memberships m WHERE m.user_id = u.id AND m.network_id <> 'default'),
 		(SELECT COUNT(*) FROM network_memberships m JOIN rooms r ON r.network_id = m.network_id WHERE m.user_id = u.id),
 		COALESCE((SELECT MAX(d.last_seen) FROM devices d WHERE d.user_id = u.id), 0),
-		u.created_at`
+		u.created_at,
+		u.active`
 }
 
 func scanAdminAccount(row interface{ Scan(...any) error }) (AdminAccountSummary, error) {
@@ -140,6 +142,7 @@ func scanAdminAccount(row interface{ Scan(...any) error }) (AdminAccountSummary,
 		&item.RoomCount,
 		&item.LastSeen,
 		&item.CreatedAt,
+		&item.Active,
 	)
 	return item, err
 }
@@ -328,7 +331,7 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 		(SELECT COUNT(*) FROM network_memberships m2 WHERE m2.network_id = r.network_id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id AND `+adminOnlineLeaseSQL("d")+`),
-		r.join_locked, r.created_at
+		r.join_locked, r.created_at, r.active
 		FROM network_memberships m
 		JOIN rooms r ON r.network_id = m.network_id
 		JOIN networks n ON n.id = r.network_id
@@ -340,12 +343,13 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 	}
 	for roomRows.Next() {
 		var item AdminRoomSummary
-		var locked int
-		if err := roomRows.Scan(&item.ID, &item.Code, &item.Name, &item.CIDR, &item.OwnerID, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &locked, &item.CreatedAt); err != nil {
+		var locked, active int
+		if err := roomRows.Scan(&item.ID, &item.Code, &item.Name, &item.CIDR, &item.OwnerID, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &locked, &item.CreatedAt, &active); err != nil {
 			roomRows.Close()
 			return nil, fmt.Errorf("scan admin account room: %w", err)
 		}
 		item.JoinLocked = locked == 1
+		item.Active = active == 1
 		detail.Rooms = append(detail.Rooms, item)
 	}
 	if err := roomRows.Close(); err != nil {

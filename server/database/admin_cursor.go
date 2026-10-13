@@ -185,7 +185,7 @@ func (db *DB) AdminAccountsSnapshot(ctx context.Context, query, cursorRaw string
 	items := make([]rowItem, 0, min(limit+1, total))
 	for rows.Next() {
 		var current rowItem
-		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.Username, &current.item.Email, &current.item.DeviceCount, &current.item.OnlineDevices, &current.item.NetworkCount, &current.item.RoomCount, &current.item.LastSeen, &current.item.CreatedAt); err != nil {
+		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.Username, &current.item.Email, &current.item.DeviceCount, &current.item.OnlineDevices, &current.item.NetworkCount, &current.item.RoomCount, &current.item.LastSeen, &current.item.CreatedAt, &current.item.Active); err != nil {
 			return nil, fmt.Errorf("scan cursor admin account: %w", err)
 		}
 		items = append(items, current)
@@ -284,11 +284,16 @@ func (db *DB) AdminDevicesSnapshot(ctx context.Context, filter AdminResourceFilt
 	for rows.Next() {
 		var current rowItem
 		var online int64
+		var presence DevicePresenceSummary
 		var relayRTT interface{}
-		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.OwnerID, &current.item.Username, &current.item.DeviceName, &current.item.Platform, &current.item.VirtualIP, &current.item.NetworkID, &current.item.NetworkName, &current.item.NATType, &relayRTT, &current.item.LastSeen, &current.item.AppVersion, &online); err != nil {
+		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.OwnerID, &current.item.Username, &current.item.DeviceName, &current.item.Platform, &current.item.VirtualIP, &current.item.NetworkID, &current.item.NetworkName, &current.item.NATType, &relayRTT, &current.item.LastSeen, &current.item.AppVersion, &online, &presence.OnlineSince, &presence.TotalOnlineSeconds, &presence.OnlineSessionCount, &presence.LastOnlineAt); err != nil {
 			return nil, fmt.Errorf("scan cursor admin device: %w", err)
 		}
 		current.item.Online = adminDeviceOnline(online, current.item.LastSeen, cutoff)
+		current.item.OnlineSince = presence.OnlineSince
+		current.item.LastOnlineAt = presence.LastOnlineAt
+		current.item.OnlineSessionCount = presence.OnlineSessionCount
+		current.item.CurrentOnlineSeconds, current.item.TotalOnlineSeconds = effectivePresence(presence, current.item.Online, current.item.LastSeen, time.Now().Unix())
 		if relayRTT != nil {
 			switch value := relayRTT.(type) {
 			case int64:
@@ -423,7 +428,7 @@ func (db *DB) AdminRoomsSnapshot(ctx context.Context, filter AdminResourceFilter
 		(SELECT COUNT(*) FROM network_memberships m WHERE m.network_id=r.network_id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id=r.network_id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id=r.network_id AND `+adminOnlineLeaseSQL("d")+`),
-		r.join_locked, r.created_at
+		r.join_locked, r.created_at, r.active
 		FROM rooms r JOIN networks n ON n.id=r.network_id JOIN users u ON u.id=r.owner_id
 		WHERE `+listWhere+`
 		ORDER BY r.rowid DESC LIMIT ?`, args...)
@@ -438,11 +443,12 @@ func (db *DB) AdminRoomsSnapshot(ctx context.Context, filter AdminResourceFilter
 	items := make([]rowItem, 0, min(limit+1, total))
 	for rows.Next() {
 		var current rowItem
-		var locked int
-		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.Code, &current.item.Name, &current.item.CIDR, &current.item.OwnerID, &current.item.OwnerUsername, &current.item.MemberCount, &current.item.DeviceCount, &current.item.OnlineDevices, &locked, &current.item.CreatedAt); err != nil {
+		var locked, active int
+		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.Code, &current.item.Name, &current.item.CIDR, &current.item.OwnerID, &current.item.OwnerUsername, &current.item.MemberCount, &current.item.DeviceCount, &current.item.OnlineDevices, &locked, &current.item.CreatedAt, &active); err != nil {
 			return nil, fmt.Errorf("scan cursor admin room: %w", err)
 		}
 		current.item.JoinLocked = locked == 1
+		current.item.Active = active == 1
 		items = append(items, current)
 	}
 	if err := rows.Err(); err != nil {

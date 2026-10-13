@@ -317,7 +317,9 @@ class _RoomsPageState extends State<RoomsPage> {
         case RoomConnectionPhase.failed:
           return '需处理';
         case RoomConnectionPhase.starting:
-          if (snapshot == null && session.snapshot == null) return '本机启动';
+          if (snapshot == null && session.snapshot == null) {
+            return session.message ?? '本机启动';
+          }
         case RoomConnectionPhase.running:
           break;
       }
@@ -1513,9 +1515,18 @@ class _RoomsPageState extends State<RoomsPage> {
     final room = roster.room;
     final connection = _parallel.session(room.id);
     final primaryConnected = connection == null && _roomSnapshot(room) != null;
-    final active =
-        connection != null ||
-        widget.settingsStore.settings.networkId == room.id;
+    final running =
+        primaryConnected ||
+        (connection?.phase == RoomConnectionPhase.running &&
+            connection?.snapshot != null);
+    final pending = connection != null &&
+        (connection.phase == RoomConnectionPhase.starting ||
+            connection.phase == RoomConnectionPhase.stopping);
+    final retryCleanup =
+        connection != null &&
+        (connection.phase == RoomConnectionPhase.failed ||
+            connection.phase == RoomConnectionPhase.unavailable);
+    final active = running;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1567,7 +1578,9 @@ class _RoomsPageState extends State<RoomsPage> {
                 const SizedBox(height: 8),
                 Text(
                   _parallel.supported
-                      ? '本机已连接 ${_parallel.activeConnections}/${_parallel.maxConnections} 个房间；各房间独立运行。'
+                      ? '本机已确认连接 ${_parallel.activeConnections} 个房间；'
+                            '另有 ${_parallel.occupiedConnectionSlots - _parallel.activeConnections} 个房间待处理，'
+                            '占用名额 ${_parallel.occupiedConnectionSlots}/${_parallel.maxConnections}。'
                       : '此平台使用单活动网络，连接本房间将断开当前网络。',
                 ),
                 const SizedBox(height: 16),
@@ -1577,18 +1590,22 @@ class _RoomsPageState extends State<RoomsPage> {
                   children: [
                     if (_canConnect)
                       FilledButton.icon(
-                        onPressed: _busy
+                        onPressed: _busy || pending
                             ? null
-                            : () => connection != null || primaryConnected
+                            : () => retryCleanup || running
                                   ? _disconnectRoom(room)
                                   : _connect(room),
                         icon: Icon(
-                          connection == null && !primaryConnected
-                              ? Icons.lan_outlined
-                              : Icons.link_off,
+                          retryCleanup || running
+                              ? Icons.link_off
+                              : Icons.lan_outlined,
                         ),
                         label: Text(
-                          connection != null || primaryConnected
+                          retryCleanup
+                              ? '重试清理'
+                              : pending
+                              ? (connection.message ?? '正在确认本机')
+                              : running
                               ? '断开本机'
                               : active
                               ? '重新连接本机'
@@ -1620,6 +1637,12 @@ class _RoomsPageState extends State<RoomsPage> {
                             : () => _issueInvite(room),
                         icon: const Icon(Icons.link_rounded),
                         label: const Text('生成邀请'),
+                      ),
+                    if (room.isOwner)
+                      TextButton.icon(
+                        onPressed: _busy ? null : () => _leave(room),
+                        icon: const Icon(Icons.delete_outline_rounded),
+                        label: const Text('删除房间'),
                       ),
                   ],
                 ),
@@ -1750,11 +1773,6 @@ class _RoomsPageState extends State<RoomsPage> {
                     TextButton(
                       onPressed: _busy ? null : () => _edit(room, true),
                       child: const Text('更改密码'),
-                    ),
-                    TextButton.icon(
-                      onPressed: _busy ? null : () => _leave(room),
-                      icon: const Icon(Icons.delete_outline),
-                      label: const Text('解散房间'),
                     ),
                   ],
                 ),

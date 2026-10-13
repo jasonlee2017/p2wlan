@@ -1,8 +1,4 @@
-import 'dart:io';
-
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:window_manager/window_manager.dart';
 
 import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
@@ -13,7 +9,6 @@ import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
-import '../../shared/widgets/windows_window_controls.dart';
 import '../../shared/widgets/app_notice.dart';
 import 'login_errors.dart';
 
@@ -95,14 +90,6 @@ class _LoginPageState extends State<LoginPage> {
     return Scaffold(
       body: Stack(
         children: [
-          if (_usesWindowsWindowControls)
-            const Positioned(
-              top: 0,
-              left: 0,
-              right: WindowsWindowControls.width,
-              height: 52,
-              child: DragToMoveArea(child: SizedBox.expand()),
-            ),
           Center(
             child: SingleChildScrollView(
               padding: const EdgeInsets.all(AppTokens.space24),
@@ -520,19 +507,31 @@ _LoginError _errorTextFor(AppStrings strings, Object error) {
         title: strings.loginFailedTitle,
         body: strings.loginErrorRegistrationFailedBody,
       );
+    case LoginErrorKind.registrationPending:
+      return _LoginError(
+        title: strings.loginErrorRegistrationPendingTitle,
+        body: strings.loginErrorRegistrationPendingBody,
+        tone: _LoginErrorTone.success,
+      );
     case LoginErrorKind.unknown:
       return _LoginError(title: strings.loginErrorUnknownTitle);
   }
 }
 
-bool get _usesWindowsWindowControls => !kIsWeb && Platform.isWindows;
 
 class _LoginError {
-  const _LoginError({required this.title, this.body});
+  const _LoginError({
+    required this.title,
+    this.body,
+    this.tone = _LoginErrorTone.danger,
+  });
 
   final String title;
   final String? body;
+  final _LoginErrorTone tone;
 }
+
+enum _LoginErrorTone { danger, success }
 
 class _LoginErrorBanner extends StatelessWidget {
   const _LoginErrorBanner({required this.error});
@@ -542,9 +541,14 @@ class _LoginErrorBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = P2WlanColors.of(context);
-    final bg = c.dangerSurface;
-    final border = c.dangerBorder;
-    final text = c.dangerText;
+    final (bg, border, text) = switch (error.tone) {
+      _LoginErrorTone.success => (
+        c.successSurface,
+        c.successBorder,
+        c.successText,
+      ),
+      _LoginErrorTone.danger => (c.dangerSurface, c.dangerBorder, c.dangerText),
+    };
     return DecoratedBox(
       decoration: BoxDecoration(
         color: bg,
