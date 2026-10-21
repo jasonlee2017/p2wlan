@@ -15,6 +15,18 @@ func migrate(db *sql.DB) error {
 		active      INTEGER NOT NULL DEFAULT 1
 	);
 
+	CREATE TABLE IF NOT EXISTS password_reset_codes (
+		id          TEXT PRIMARY KEY,
+		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		token_hash  BLOB NOT NULL,
+		expires_at  INTEGER NOT NULL,
+		attempts    INTEGER NOT NULL DEFAULT 0,
+		consumed    INTEGER NOT NULL DEFAULT 0,
+		created_at  INTEGER NOT NULL
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_password_reset_codes_hash ON password_reset_codes(token_hash);
+	CREATE INDEX IF NOT EXISTS idx_password_reset_codes_user ON password_reset_codes(user_id, consumed, expires_at);
+
 	CREATE TABLE IF NOT EXISTS networks (
 		id          TEXT PRIMARY KEY,
 		name        TEXT NOT NULL,
@@ -192,6 +204,7 @@ func migrate(db *sql.DB) error {
 		{"devices", "ed25519_public_key", "TEXT NOT NULL DEFAULT ''"},
 		{"users", "username", "TEXT NOT NULL DEFAULT ''"},
 		{"users", "active", "INTEGER NOT NULL DEFAULT 1"},
+		{"users", "password_version", "INTEGER NOT NULL DEFAULT 1"},
 		{"devices", "app_version", "TEXT NOT NULL DEFAULT ''"},
 		{"devices", "relay_rtt_ms", "INTEGER"},
 		{"devices", "registration_seq", "INTEGER NOT NULL DEFAULT 1"},

@@ -43,6 +43,8 @@ enum Commands {
     Login(AuthArgs),
     /// Create an account and save the session
     Register(AuthArgs),
+    /// Reset an account password with an administrator-issued one-time code
+    ResetPassword(ResetPasswordArgs),
     /// Remove the saved control-server session
     Logout,
     /// Show the current account identity from the control server
@@ -110,6 +112,19 @@ struct AuthArgs {
     server: Option<String>,
 }
 
+#[derive(Args, Debug)]
+struct ResetPasswordArgs {
+    /// Account email address or username
+    #[arg(short = 'u', long = "username", alias = "email")]
+    username: String,
+    /// One-time recovery code issued by a server administrator. Omit to enter it without echo.
+    #[arg(short = 'c', long)]
+    code: Option<String>,
+    /// Control server URL
+    #[arg(short = 's', long, value_name = "URL")]
+    server: Option<String>,
+}
+
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
     /// Show the effective configuration with secrets redacted
@@ -165,6 +180,7 @@ struct AuthResponse {
     token: Option<String>,
     activation_required: Option<bool>,
     error: Option<String>,
+    error_code: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -202,6 +218,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Commands::Login(args) => authenticate(&config_path, args, false).await,
         Commands::Register(args) => authenticate(&config_path, args, true).await,
+        Commands::ResetPassword(args) => reset_password(&config_path, args).await,
         Commands::Logout => logout(&config_path).await,
         Commands::Account { command } => account_command(&config_path, command).await,
         Commands::Up => start(&config_path).await,

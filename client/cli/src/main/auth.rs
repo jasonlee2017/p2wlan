@@ -117,6 +117,55 @@ async fn authenticate(path: &Path, args: AuthArgs, register: bool) -> Result<(),
     Ok(())
 }
 
+async fn reset_password(path: &Path, args: ResetPasswordArgs) -> Result<(), String> {
+    reject_sudo_config_write()?;
+    let identifier = args.username.trim().to_string();
+    if identifier.is_empty() {
+        return Err("请输入邮箱或用户名".to_string());
+    }
+    let existing = if path.exists() { Some(load_config(path)?) } else { None };
+    let server = args.server.or_else(|| existing.as_ref().map(|c| c.control.server_url.clone())).unwrap_or_default();
+    if server.trim().is_empty() {
+        return Err("尚未配置控制服务器，请使用 --server 指定地址".to_string());
+    }
+    let server = normalize_control_server(&server)?;
+    let code = match args.code {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => rpassword::prompt_password("一次性恢复码: ").map_err(|error| format!("无法读取恢复码：{error}"))?,
+    };
+    if code.trim().is_empty() {
+        return Err("恢复码不能为空".to_string());
+    }
+    let password = rpassword::prompt_password("新密码: ").map_err(|error| format!("无法读取新密码：{error}"))?;
+    let confirmation = rpassword::prompt_password("确认新密码: ").map_err(|error| format!("无法读取确认密码：{error}"))?;
+    if password.len() < 6 {
+        return Err("密码至少需要 6 个字符".to_string());
+    }
+    if password != confirmation {
+        return Err("两次输入的密码不一致".to_string());
+    }
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .no_proxy()
+        .build()
+        .map_err(|error| format!("无法初始化网络请求：{error}"))?
+        .post(format!("{server}/api/v1/password-reset"))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&serde_json::json!({"identifier": identifier, "code": code, "password": password}))
+        .send()
+        .await
+        .map_err(|error| format!("无法连接控制服务器：{error}"))?;
+    let status = response.status();
+    let body_text = response.text().await.map_err(|error| format!("无法读取控制服务器响应：{error}"))?;
+    let body: AuthResponse = serde_json::from_str(&body_text).map_err(|_| format!("控制服务器返回了无效响应（HTTP {status}）"))?;
+    if !status.is_success() || body.success != Some(true) {
+        let message = body.error_code.as_deref().or(body.error.as_deref()).unwrap_or(&body_text);
+        return Err(auth_error(message, status.as_u16()));
+    }
+    println!("密码已重置，请使用新密码运行 `p2wlan login` 登录。设备凭据保持不变。" );
+    Ok(())
+}
+
 async fn logout(path: &Path) -> Result<(), String> {
     reject_sudo_config_write()?;
     let mut config = load_config(path)?;

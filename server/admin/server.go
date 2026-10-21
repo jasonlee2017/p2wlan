@@ -110,6 +110,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}/topology", s.requireAdmin(s.accountTopology))
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}", s.requireAdmin(s.account))
 	mux.HandleFunc("PATCH /admin/api/v1/accounts/{id}/activation", s.requireAdmin(s.accountActivation))
+	mux.HandleFunc("POST /admin/api/v1/accounts/{id}/password-reset-codes", s.requireAdmin(s.passwordResetCode))
 	mux.HandleFunc("DELETE /admin/api/v1/accounts/{id}", s.requireAdmin(s.deleteAccount))
 	mux.HandleFunc("GET /admin/api/v1/topology", s.requireAdmin(s.topology))
 	mux.HandleFunc("GET /admin/api/v1/devices", s.requireAdmin(s.devices))

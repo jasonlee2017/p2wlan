@@ -113,6 +113,7 @@ func main() {
 	// User auth routes (JWT)
 	mux.HandleFunc("POST /api/v1/login", rateLimit(apiServer.Login, 30, time.Minute))
 	mux.HandleFunc("POST /api/v1/register", rateLimit(apiServer.Register, 10, time.Minute))
+	mux.HandleFunc("POST /api/v1/password-reset", rateLimit(apiServer.PasswordReset, 10, time.Minute))
 	mux.HandleFunc("POST /api/v1/challenges", authService.RequireAuth(apiServer.CreateChallenge))
 	mux.HandleFunc("POST /api/v1/devices/credential", authService.RequireAuth(apiServer.SubmitDeviceCredential))
 	mux.HandleFunc("GET /api/v1/networks", authService.RequireAuth(apiServer.ListNetworks))
@@ -124,6 +125,7 @@ func main() {
 
 	mux.HandleFunc("GET /api/v1/profile", authService.RequireAuth(apiServer.Profile))
 	mux.HandleFunc("PATCH /api/v1/profile", authService.RequireAuth(apiServer.Profile))
+	mux.HandleFunc("POST /api/v1/password-change", authService.RequireAuth(apiServer.ChangePassword))
 
 	registerDeviceControlRoutes(mux, authService, db, apiServer, hub)
 

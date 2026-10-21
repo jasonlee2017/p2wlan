@@ -41,8 +41,9 @@ func NewService(secret string, db *database.DB) *Service {
 
 // Claims represents JWT claims.
 type Claims struct {
-	UserID string `json:"user_id"`
-	Email  string `json:"email"`
+	UserID          string `json:"user_id"`
+	Email           string `json:"email"`
+	PasswordVersion int64  `json:"password_version"`
 	jwt.RegisteredClaims
 }
 
@@ -56,7 +57,9 @@ func (s *Service) Login(identifier, password string) (string, *database.User, er
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
 		return "", nil, ErrInvalidCredentials
 	}
-	if !user.Active { return "", nil, ErrAccountPending }
+	if !user.Active {
+		return "", nil, ErrAccountPending
+	}
 
 	token, err := s.generateToken(user)
 	if err != nil {
@@ -75,6 +78,39 @@ func (s *Service) Register(email, password string) (string, *database.User, erro
 // administrator activates it. The HTTP registration endpoint uses this path.
 func (s *Service) RegisterPending(email, password string) (string, *database.User, error) {
 	return s.register(email, password, false)
+}
+
+// ResetPassword applies a bcrypt password hash after a one-time reset code has
+// been validated and consumed by the database transaction.
+func (s *Service) ResetPassword(userID, code, password string) error {
+	if len(password) < 6 {
+		return errors.New("invalid password")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	return s.db.ResetPassword(userID, code, string(hash), time.Now().UTC())
+}
+
+// ChangePassword changes the password for an authenticated user and bumps its
+// password version so all existing JWT sessions expire immediately.
+func (s *Service) ChangePassword(userID, currentPassword, newPassword string) error {
+	if len(newPassword) < 6 {
+		return errors.New("invalid password")
+	}
+	user, err := s.db.GetUserAuthByID(userID)
+	if err != nil {
+		return ErrInvalidCredentials
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(currentPassword)); err != nil {
+		return ErrInvalidCredentials
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	return s.db.SetUserPassword(userID, string(hash))
 }
 
 func (s *Service) register(email, password string, active bool) (string, *database.User, error) {
@@ -119,8 +155,17 @@ func (s *Service) ValidateToken(tokenStr string) (*Claims, error) {
 	}
 
 	if s.db != nil {
-		active, err := s.db.IsAccountActive(claims.UserID)
-		if err != nil || !active { return nil, ErrAccountPending }
+		user, err := s.db.GetUserByIDWithPasswordVersion(claims.UserID)
+		if err != nil || !user.Active {
+			return nil, ErrAccountPending
+		}
+		// Tokens issued before password_version was introduced have a zero
+		// claim. Keep those sessions valid until the account password changes;
+		// the first reset/change moves the stored version above 1 and fences them.
+		if (claims.PasswordVersion == 0 && user.PasswordVersion != 1) ||
+			(claims.PasswordVersion != 0 && claims.PasswordVersion != user.PasswordVersion) {
+			return nil, ErrInvalidToken
+		}
 	}
 	return claims, nil
 }
@@ -203,8 +248,9 @@ func GetClaims(ctx context.Context) (*Claims, error) {
 
 func (s *Service) generateToken(user *database.User) (string, error) {
 	claims := &Claims{
-		UserID: user.ID,
-		Email:  user.Email,
+		UserID:          user.ID,
+		Email:           user.Email,
+		PasswordVersion: user.PasswordVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)), // 7 days
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

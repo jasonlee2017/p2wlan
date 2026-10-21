@@ -11,6 +11,7 @@ import type {
   AdminDevice,
   AdminNetwork,
   AdminOverview,
+  AdminPasswordResetCodeResponse,
   AdminRoom,
   AdminResourceFilters,
   AdminRuntime,
@@ -123,6 +124,7 @@ export const adminApi = {
 	setAccountActive: (id: string, active: boolean) => api<{ success: boolean; active: boolean }>(`/accounts/${encodeURIComponent(id)}/activation`, undefined, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) }),
 	setRoomActive: (id: string, active: boolean) => api<{ success: boolean; active: boolean }>(`/rooms/${encodeURIComponent(id)}/activation`, undefined, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) }),
 	deleteAccount: (id: string) => api<{ success: boolean }>(`/accounts/${encodeURIComponent(id)}`, undefined, { method: 'DELETE' }),
+	issuePasswordResetCode: (id: string) => api<AdminPasswordResetCodeResponse>(`/accounts/${encodeURIComponent(id)}/password-reset-codes`, undefined, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: true }) }),
 	deleteRoom: (id: string) => api<{ success: boolean }>(`/rooms/${encodeURIComponent(id)}`, undefined, { method: 'DELETE' }),
 	deleteDevice: (id: string) => api<{ success: boolean }>(`/devices/${encodeURIComponent(id)}`, undefined, { method: 'DELETE' }),
   accountsSnapshot: (query = '', cursor = '', limit = 25, signal?: AbortSignal) =>

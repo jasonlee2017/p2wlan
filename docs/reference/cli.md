@@ -5,6 +5,7 @@
 | p2wlan config set control URL | 设置 Control 地址 |
 | p2wlan config show | 查看非秘密配置 |
 | p2wlan login -u USER | 登录或注册当前账号 |
+| p2wlan reset-password -u USER | 使用管理员一次性恢复码重置密码 |
 | p2wlan account show | 显示当前账号身份 |
 | p2wlan up / down | 启动或停止虚拟网络 |
 | p2wlan status [--json] | 查看 daemon、设备和路径状态 |
@@ -19,3 +20,5 @@
 | p2wlan update | 按当前安装源更新 |
 
 准确参数以 p2wlan help 和当前 Release 内的 CLI 为准。登录、配置和查询不要使用 sudo；创建 TUN、路由和 systemd 服务可能需要权限。
+
+`p2wlan reset-password -u USER --server https://control.example.com` 会交互式读取管理员提供的一次性恢复码、新密码和确认密码；也可以用 `--code` 传入恢复码。恢复码只在 15 分钟内有效且只能使用一次，管理员应通过可信的站外渠道交付。重置密码会使旧账号 JWT 失效，但保留已登记的设备凭据，避免所有节点同时掉线。当前版本不提供邮箱验证或邮件找回。

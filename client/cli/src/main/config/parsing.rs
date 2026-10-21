@@ -93,7 +93,13 @@ fn normalize_control_server(input: &str) -> Result<String, String> {
 
 fn auth_error(message: &str, status: u16) -> String {
     let lower = message.to_lowercase();
-    if lower.contains("account pending") || lower.contains("account_pending") {
+    if lower.contains("password_reset_expired") {
+        "恢复码已过期，请联系管理员重新生成".to_string()
+    } else if lower.contains("password_reset_attempts_exceeded") {
+        "恢复码尝试次数已用尽，请联系管理员重新生成".to_string()
+    } else if lower.contains("password_reset_invalid") {
+        "恢复码无效或已使用，请检查后重试".to_string()
+    } else if lower.contains("account pending") || lower.contains("account_pending") {
         "账号已注册，等待服务器管理员激活后才能连接".to_string()
     } else if lower.contains("invalid credentials") {
         "邮箱或密码错误".to_string()

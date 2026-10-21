@@ -2,7 +2,7 @@
 
 ## 身份与凭据
 
-设备控制面身份、数据面会话密钥、Relay ticket、JWT、管理控制台令牌、Relay 票据签名 key、撤权 feed token 和 TLS 私钥承担不同职责，不能互相替代。管理控制台令牌只授权同一 Control 实例的只读管理 API，不授予设备身份、房间成员身份或 Relay 数据连接权限。ticket 必须绑定 audience、region、设备/网络身份和短期过期时间；Relay 在撤权 feed 未就绪或过期时拒绝新的认证连接。
+设备控制面身份、数据面会话密钥、Relay ticket、JWT、管理控制台令牌、Relay 票据签名 key、撤权 feed token 和 TLS 私钥承担不同职责，不能互相替代。管理控制台令牌只授权同一 Control 实例的管理 API；该接口可管理账号和资源、签发一次性密码恢复码并读取受限运维观测，但不授予设备身份、房间成员身份或 Relay 数据连接权限。ticket 必须绑定 audience、region、设备/网络身份和短期过期时间；Relay 在撤权 feed 未就绪或过期时拒绝新的认证连接。
 
 ## 本地诊断认证
 

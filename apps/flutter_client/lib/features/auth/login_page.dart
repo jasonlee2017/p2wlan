@@ -245,6 +245,12 @@ class _LoginPageState extends State<LoginPage> {
                                       : strings.noAccountYet,
                                 ),
                               ),
+                              if (!_register)
+                                TextButton.icon(
+                                  onPressed: _submitting ? null : _showPasswordReset,
+                                  icon: const Icon(Icons.lock_reset_outlined),
+                                  label: Text(strings.forgotPassword),
+                                ),
                               const Divider(height: 24),
                               _AdvancedDisclosure(
                                 open: _showAdvanced,
@@ -453,6 +459,81 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
+  Future<void> _showPasswordReset() async {
+    final strings = AppStringsScope.of(context);
+    final identifierController = TextEditingController(text: _emailController.text.trim());
+    final codeController = TextEditingController();
+    final passwordController = TextEditingController();
+    final confirmController = TextEditingController();
+    var submitting = false;
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            title: Text(strings.resetPasswordTitle),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(strings.resetPasswordHelp),
+                  const SizedBox(height: 16),
+                  TextField(controller: identifierController, decoration: InputDecoration(labelText: strings.loginIdentifier)),
+                  const SizedBox(height: 10),
+                  TextField(controller: codeController, decoration: InputDecoration(labelText: strings.resetPasswordCode)),
+                  const SizedBox(height: 10),
+                  TextField(controller: passwordController, obscureText: true, decoration: InputDecoration(labelText: strings.newPassword)),
+                  const SizedBox(height: 10),
+                  TextField(controller: confirmController, obscureText: true, decoration: InputDecoration(labelText: strings.confirmPassword)),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: submitting ? null : () => Navigator.pop(dialogContext), child: Text(strings.cancel)),
+              FilledButton.icon(
+                onPressed: submitting
+                    ? null
+                    : () async {
+                        if (passwordController.text != confirmController.text) {
+                          _presentError(_LoginError(title: strings.passwordResetFailed, body: strings.passwordResetMismatch));
+                          return;
+                        }
+                        setDialogState(() => submitting = true);
+                        try {
+                          await _controlApi.resetPassword(
+                            controlServer: _controlServerController.text,
+                            identifier: identifierController.text,
+                            code: codeController.text,
+                            password: passwordController.text,
+                          );
+                          if (dialogContext.mounted) Navigator.pop(dialogContext);
+                          if (mounted) {
+                            _emailController.text = identifierController.text.trim();
+                            _passwordController.clear();
+                            _presentError(_LoginError(title: strings.resetPasswordTitle, body: strings.passwordResetSuccess, tone: _LoginErrorTone.success));
+                          }
+                        } catch (error) {
+                          if (mounted) _presentError(_errorTextFor(strings, error));
+                        } finally {
+                          if (dialogContext.mounted) setDialogState(() => submitting = false);
+                        }
+                      },
+                icon: const Icon(Icons.lock_reset_outlined),
+                label: Text(strings.resetPasswordAction),
+              ),
+            ],
+          ),
+        ),
+      );
+    } finally {
+      identifierController.dispose();
+      codeController.dispose();
+      passwordController.dispose();
+      confirmController.dispose();
+    }
+  }
+
   void _presentError(_LoginError error) {
     if (!mounted) return;
     showAppNotice(
@@ -512,6 +593,11 @@ _LoginError _errorTextFor(AppStrings strings, Object error) {
         title: strings.loginErrorRegistrationPendingTitle,
         body: strings.loginErrorRegistrationPendingBody,
         tone: _LoginErrorTone.success,
+      );
+    case LoginErrorKind.passwordReset:
+      return _LoginError(
+        title: strings.passwordResetFailed,
+        body: error is ControlApiException ? error.message : null,
       );
     case LoginErrorKind.unknown:
       return _LoginError(title: strings.loginErrorUnknownTitle);

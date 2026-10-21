@@ -6,7 +6,7 @@ P2WLAN 将控制面、数据面和中继分开：
 - Rust daemon 负责 TUN、路由、Peer、NAT traversal、加密会话、路径状态、Direct/Relay 选择与向 Control 异步上报权威路径遥测。daemon 是活动路径事实的唯一所有者，Control 不推断或猜测数据面路径。
 - Relay（Go）验证短期票据并转发密文，不解密业务载荷。
 - Flutter 提供面向终端用户的跨平台客户端界面；CLI 复用 daemon 的本地控制接口。新的终端用户功能和 daemon↔客户端交互仍以 Flutter 客户端为产品入口。
-- `server/admin-ui` 是面向自托管服务管理员的只读 Control 运维界面，生命周期、权限和数据契约都属于服务端。它使用 React/TypeScript/Vite 开发，但 production 静态产物由 Go 嵌入 `p2wlan-control`，不替代 Flutter 客户端，也不向普通账号提供客户端能力。
+- `server/admin-ui` 是面向自托管服务管理员的 Control 运维界面，提供受管理员令牌保护的资源管理、一次性密码恢复码签发和路径观测查询。生命周期、权限和数据契约都属于服务端。它使用 React/TypeScript/Vite 开发，但 production 静态产物由 Go 嵌入 `p2wlan-control`，不替代 Flutter 客户端，也不向普通账号提供客户端能力。
 
 Control 的 HTTPS/WSS 只负责控制、信令和路径遥测上报，Relay 的 TLS 连接负责数据转发。服务器不会因为部署了 Control/Relay 就自动加入房间或替客户端创建 TUN。
 

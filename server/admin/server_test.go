@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -18,6 +19,13 @@ import (
 )
 
 type fakeStore struct{}
+
+func (fakeStore) IssuePasswordResetCode(id string, _ time.Time) (string, int64, error) {
+	if id == "missing" {
+		return "", 0, sql.ErrNoRows
+	}
+	return "prw-test-code", 1_700_000_900, nil
+}
 
 func (s fakeStore) AdminAccountSummary(_ context.Context, id string) (*database.AdminAccountSummaryResponse, error) {
 	detail, err := s.AdminAccount(id)
@@ -372,6 +380,12 @@ func TestAdminAPIRequiresBearerToken(t *testing.T) {
 			t.Fatalf("%s: expected 401, got %d", path, unauthorized.Code)
 		}
 	}
+	resetUnauthorized := httptest.NewRecorder()
+	resetRequest := httptest.NewRequest(http.MethodPost, "/admin/api/v1/accounts/u1/password-reset-codes", strings.NewReader(`{"confirm":true}`))
+	mux.ServeHTTP(resetUnauthorized, resetRequest)
+	if resetUnauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("password reset code route without admin token: expected 401, got %d", resetUnauthorized.Code)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/overview", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -385,6 +399,29 @@ func TestAdminAPIRequiresBearerToken(t *testing.T) {
 	}
 	if strings.Contains(res.Body.String(), token) {
 		t.Fatal("admin token leaked into response")
+	}
+}
+
+func TestAdminPasswordResetCodeRequiresConfirmationAndReturnsCodeOnce(t *testing.T) {
+	token := strings.Repeat("r", 32)
+	server := testServer(t, token)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	withoutConfirmation := httptest.NewRequest(http.MethodPost, "/admin/api/v1/accounts/u1/password-reset-codes", strings.NewReader(`{}`))
+	withoutConfirmation.Header.Set("Authorization", "Bearer "+token)
+	badResponse := httptest.NewRecorder()
+	mux.ServeHTTP(badResponse, withoutConfirmation)
+	if badResponse.Code != http.StatusBadRequest {
+		t.Fatalf("missing confirmation status = %d, body = %s", badResponse.Code, badResponse.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/v1/accounts/u1/password-reset-codes", strings.NewReader(`{"confirm":true}`))
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"code":"prw-test-code"`) || !strings.Contains(response.Body.String(), `"expires_at":1700000900`) {
+		t.Fatalf("unexpected password reset code response %d: %s", response.Code, response.Body.String())
 	}
 }
 

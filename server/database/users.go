@@ -14,12 +14,13 @@ import (
 
 // User represents a registered user.
 type User struct {
-	Username     string `json:"username"`
-	ID           string `json:"id"`
-	Email        string `json:"email"`
-	PasswordHash string `json:"-"`
-	CreatedAt    int64  `json:"created_at"`
-	Active       bool   `json:"active"`
+	Username        string `json:"username"`
+	ID              string `json:"id"`
+	Email           string `json:"email"`
+	PasswordHash    string `json:"-"`
+	CreatedAt       int64  `json:"created_at"`
+	Active          bool   `json:"active"`
+	PasswordVersion int64  `json:"-"`
 }
 
 var ErrAccountPending = errors.New("account is pending administrator activation")
@@ -60,7 +61,9 @@ func (db *DB) createUser(email, passwordHash string, active bool) (*User, error)
 	now := time.Now().Unix()
 
 	activeValue := 0
-	if active { activeValue = 1 }
+	if active {
+		activeValue = 1
+	}
 	_, err = tx.Exec(`INSERT INTO users (id, email, password_hash, created_at, active) VALUES (?, ?, ?, ?, ?)`, id, email, passwordHash, now, activeValue)
 	if err != nil {
 		return nil, err
@@ -77,14 +80,14 @@ func (db *DB) createUser(email, passwordHash string, active bool) (*User, error)
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &User{ID: id, Email: email, PasswordHash: passwordHash, CreatedAt: now, Active: active}, nil
+	return &User{ID: id, Email: email, PasswordHash: passwordHash, CreatedAt: now, Active: active, PasswordVersion: 1}, nil
 }
 
 // GetUserByEmail looks up a user by email.
 func (db *DB) GetUserByEmail(email string) (*User, error) {
 	var u User
-	err := db.QueryRow(`SELECT id, email, password_hash, created_at, username, active FROM users WHERE email = ?`, email).
-		Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt, &u.Username, &u.Active)
+	err := db.QueryRow(`SELECT id, email, password_hash, created_at, username, active, password_version FROM users WHERE email = ?`, email).
+		Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt, &u.Username, &u.Active, &u.PasswordVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +107,7 @@ func (db *DB) GetUserByLoginIdentifier(identifier string) (*User, error) {
 	}
 
 	rows, err := db.Query(`
-		SELECT id, email, password_hash, created_at, username, active
+		SELECT id, email, password_hash, created_at, username, active, password_version
 		FROM users
 		WHERE username = ?
 		LIMIT 2`, identifier)
@@ -124,6 +127,7 @@ func (db *DB) GetUserByLoginIdentifier(identifier string) (*User, error) {
 			&user.CreatedAt,
 			&user.Username,
 			&user.Active,
+			&user.PasswordVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -157,18 +161,40 @@ func ValidUsername(name string) bool {
 
 func (db *DB) GetUserByID(id string) (*User, error) {
 	var u User
-	err := db.QueryRow(`SELECT id, email, username, created_at, active FROM users WHERE id = ?`, id).Scan(&u.ID, &u.Email, &u.Username, &u.CreatedAt, &u.Active)
+	err := db.QueryRow(`SELECT id, email, username, created_at, active, password_version FROM users WHERE id = ?`, id).Scan(&u.ID, &u.Email, &u.Username, &u.CreatedAt, &u.Active, &u.PasswordVersion)
+	return &u, err
+}
+
+// GetUserByIDWithPasswordVersion returns the account fields needed to fence a JWT.
+func (db *DB) GetUserByIDWithPasswordVersion(id string) (*User, error) {
+	return db.GetUserByID(id)
+}
+
+// GetUserAuthByID returns the password hash and fencing version for password
+// changes. It is intentionally not used by profile or admin resource reads.
+func (db *DB) GetUserAuthByID(id string) (*User, error) {
+	var u User
+	err := db.QueryRow(`SELECT id, email, password_hash, created_at, username, active, password_version FROM users WHERE id = ?`, id).
+		Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt, &u.Username, &u.Active, &u.PasswordVersion)
 	return &u, err
 }
 
 func (db *DB) SetAccountActive(id string, active bool) error {
 	value := 0
-	if active { value = 1 }
+	if active {
+		value = 1
+	}
 	result, err := db.Exec(`UPDATE users SET active = ? WHERE id = ? AND id <> 'system'`, value, strings.TrimSpace(id))
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	count, err := result.RowsAffected()
-	if err != nil { return err }
-	if count == 0 { return sql.ErrNoRows }
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return sql.ErrNoRows
+	}
 	return nil
 }
 
@@ -192,7 +218,7 @@ func (db *DB) DeleteAccount(id string) error {
 	if !exists {
 		return sql.ErrNoRows
 	}
-	deviceRows, err := tx.Query(`SELECT id FROM devices WHERE user_id = ?` , id)
+	deviceRows, err := tx.Query(`SELECT id FROM devices WHERE user_id = ?`, id)
 	if err != nil {
 		return err
 	}

@@ -737,6 +737,18 @@ class AppStrings {
   String get email => isZh ? '邮箱' : 'Email';
   String get password => isZh ? '密码' : 'Password';
   String get signIn => isZh ? '登录' : 'Sign in';
+  String get forgotPassword => isZh ? '忘记密码？使用管理员恢复码' : 'Forgot password? Use an administrator recovery code';
+  String get resetPasswordTitle => isZh ? '找回密码' : 'Recover password';
+  String get resetPasswordHelp => isZh
+      ? '请先让服务器管理员生成一次性恢复码。恢复码 15 分钟内有效，只能使用一次。'
+      : 'Ask the server administrator for a one-time recovery code. It is valid for 15 minutes and can be used once.';
+  String get resetPasswordCode => isZh ? '一次性恢复码' : 'One-time recovery code';
+  String get newPassword => isZh ? '新密码' : 'New password';
+  String get confirmPassword => isZh ? '确认新密码' : 'Confirm new password';
+  String get resetPasswordAction => isZh ? '重置密码' : 'Reset password';
+  String get passwordResetSuccess => isZh ? '密码已重置，请使用新密码登录。' : 'Password reset. Sign in with the new password.';
+  String get passwordResetMismatch => isZh ? '两次输入的新密码不一致。' : 'The new passwords do not match.';
+  String get passwordResetFailed => isZh ? '密码重置失败' : 'Password reset failed';
   String get signingIn => isZh ? '登录中...' : 'Signing in...';
   String get createAccount => isZh ? '创建账号' : 'Create account';
   String get creatingAccount => isZh ? '创建账号中...' : 'Creating account...';

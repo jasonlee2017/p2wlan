@@ -36,6 +36,9 @@ enum LoginErrorKind {
   /// activation before it can sign in.
   registrationPending,
 
+  /// Administrator-issued recovery code rejected or expired.
+  passwordReset,
+
   /// Anything that cannot be classified safely.
   unknown,
 }
@@ -94,6 +97,9 @@ LoginErrorKind _kindForControlMessage(String message) {
   if (message.startsWith('注册成功，等待服务器管理员激活后才能登录') ||
       message.startsWith('账号已注册，等待服务器管理员激活后才能连接')) {
     return LoginErrorKind.registrationPending;
+  }
+  if (message.startsWith('恢复码')) {
+    return LoginErrorKind.passwordReset;
   }
   if (message.startsWith('邮箱') ||
       message.startsWith('密码') ||

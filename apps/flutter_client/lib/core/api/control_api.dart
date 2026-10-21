@@ -131,6 +131,36 @@ class ControlApi {
     );
   }
 
+  Future<void> resetPassword({
+    required String controlServer,
+    required String identifier,
+    required String code,
+    required String password,
+  }) async {
+    final normalizedIdentifier = identifier.trim();
+    final normalizedCode = code.trim();
+    if (normalizedIdentifier.isEmpty) {
+      throw const ControlApiException('请输入邮箱或用户名');
+    }
+    if (normalizedCode.isEmpty) {
+      throw const ControlApiException('请输入管理员提供的一次性恢复码');
+    }
+    if (password.length < 6) {
+      throw const ControlApiException('密码至少需要 6 个字符');
+    }
+    await _sendJson(
+      method: 'POST',
+      uri: Uri.parse('${_normalizeAuthControlServer(controlServer)}/api/v1/password-reset'),
+      payload: <String, dynamic>{
+        'identifier': normalizedIdentifier.contains('@')
+            ? normalizedIdentifier.toLowerCase()
+            : normalizedIdentifier,
+        'code': normalizedCode,
+        'password': password,
+      },
+    );
+  }
+
   Future<String> profileUsername({
     required String controlServer,
     required String authToken,
@@ -727,6 +757,15 @@ String _zhAuthError(
 ]) {
   final raw = message?.trim() ?? '';
   final normalized = raw.toLowerCase();
+  if (normalized.contains('password_reset_expired')) {
+    return '恢复码已过期，请联系管理员重新生成。';
+  }
+  if (normalized.contains('password_reset_attempts_exceeded')) {
+    return '恢复码尝试次数已用尽，请联系管理员重新生成。';
+  }
+  if (normalized.contains('password_reset_invalid')) {
+    return '恢复码无效或已使用，请检查后重试。';
+  }
   if (normalized.contains('account pending') || normalized.contains('account_pending')) return '账号已注册，等待服务器管理员激活后才能连接';
   if (statusCode == 401) return unauthorizedMessage ?? '认证失败，请检查邮箱和密码';
   if (statusCode == 403) return '当前账号没有权限执行该操作';

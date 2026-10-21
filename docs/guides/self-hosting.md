@@ -82,7 +82,7 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 支持日志使用独立的私有持久目录。标准安装显式设置 `LOG_UPLOAD_DIR` 为数据目录下的 `log-uploads`，不依赖进程工作目录；受管理目录由 `p2wlan` 拥有并限制为 `0700`。自定义值由部署者创建并检查服务账户和 systemd 的访问权限；Compose 自定义路径还须位于可写的持久挂载内。不要把支持日志放进发布目录或公共下载目录。
 
-管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；删除 `CONTROL_ADMIN_TOKEN` 并重启 Control 即可完全关闭管理面，此时 `/admin` 与 `/admin/*` 对任意 HTTP 方法都返回 404。管理台可激活或停用账号和房间，也可在二次确认后永久删除账号、房间和设备；删除房间或设备会撤销相关凭据、清理连接状态并释放房间虚拟 IP。管理台不负责重启服务。
+管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；删除 `CONTROL_ADMIN_TOKEN` 并重启 Control 即可完全关闭管理面，此时 `/admin` 与 `/admin/*` 对任意 HTTP 方法都返回 404。管理台可激活或停用账号和房间、在二次确认后永久删除账号/房间/设备，也可为账号签发一次性密码恢复码；恢复码明文只返回一次，必须通过可信的站外渠道交给账号所有者。删除房间或设备会撤销相关凭据、清理连接状态并释放房间虚拟 IP。管理台不负责重启服务。
 
 管理台源码位于 `server/admin-ui/`，`src/features/` 按功能组织页面，`src/layout/` 管理外壳，`src/components/ui/` 与 `src/shared/` 复用界面和交互，`src/styles/app.css` 是应用样式入口；CI 按锁文件执行 `npm ci` 并重新构建，再与仓库中已提交的 `server/admin/web/` 逐字节比对，因此源码改动后忘记重新构建会被 CI 拦下。服务端 tag / staging 构建也会在 `go build` 前重新执行 typecheck 和 production build，再由 Go 将生成目录嵌入 Control。这保证发布归档和本地 `go build` 都不会携带过期 UI，同时服务端安装和升级路径仍然只围绕原有服务端归档，不引入第二套前端发布流程。
 

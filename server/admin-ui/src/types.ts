@@ -92,6 +92,13 @@ export interface AdminAccountSummaryResponse {
   account: AdminAccount
 }
 
+export interface AdminPasswordResetCodeResponse {
+  success: boolean
+  code: string
+  expires_at: number
+  warning: string
+}
+
 export interface AdminResourceFilters {
   query?: string
   accountId?: string
