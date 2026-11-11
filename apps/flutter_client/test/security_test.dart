@@ -59,6 +59,83 @@ void main() {
       await repo.clear();
       expect(await repo.read(), isNull);
     });
+
+    test(
+      'migrates the legacy Windows secure token into the local file',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp(
+          'p2wlan_token_migrate_',
+        );
+        addTearDown(() async => tmp.delete(recursive: true));
+        final file = File('${tmp.path}/p2wlan-auth-token');
+        var legacyReads = 0;
+        var legacyClears = 0;
+        final repo = LocalTokenRepository(
+          file: file,
+          isWindows: true,
+          legacyWindowsTokenReader: () async {
+            legacyReads++;
+            return 'legacy-windows-token';
+          },
+          legacyWindowsTokenClearer: () async {
+            legacyClears++;
+          },
+        );
+
+        expect(await repo.read(), 'legacy-windows-token');
+        expect(await file.readAsString(), 'legacy-windows-token');
+        expect(legacyClears, 1);
+        expect(await repo.read(), 'legacy-windows-token');
+        expect(legacyReads, 1);
+        expect(legacyClears, 1);
+      },
+    );
+
+    test('keeps legacy Windows token when local migration write fails', () async {
+      final tmp = await Directory.systemTemp.createTemp(
+        'p2wlan_token_migrate_fail_',
+      );
+      addTearDown(() async => tmp.delete(recursive: true));
+      var legacyClears = 0;
+      final repo = LocalTokenRepository(
+        file: File(tmp.path),
+        isWindows: true,
+        legacyWindowsTokenReader: () async => 'legacy-windows-token',
+        legacyWindowsTokenClearer: () async {
+          legacyClears++;
+        },
+      );
+
+      await expectLater(
+        repo.read(),
+        throwsA(isA<SecureTokenStorageException>()),
+      );
+      expect(legacyClears, 0);
+    });
+
+    test(
+      'uses an existing local token before consulting legacy storage',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp(
+          'p2wlan_token_precedence_',
+        );
+        addTearDown(() async => tmp.delete(recursive: true));
+        final file = File('${tmp.path}/p2wlan-auth-token');
+        await file.writeAsString('current-token');
+        var legacyReads = 0;
+        final repo = LocalTokenRepository(
+          file: file,
+          isWindows: true,
+          legacyWindowsTokenReader: () async {
+            legacyReads++;
+            return 'legacy-windows-token';
+          },
+        );
+
+        expect(await repo.read(), 'current-token');
+        expect(legacyReads, 0);
+      },
+    );
   });
 
   group('InMemorySecureTokenRepository', () {

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
@@ -7,6 +8,7 @@ import 'package:p2wlan_flutter_client/core/daemon/runtime_identity.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/rooms/parallel_rooms.dart';
 import 'package:p2wlan_flutter_client/core/rooms/room_api.dart';
+import 'package:p2wlan_flutter_client/core/rooms/room_connection_preferences.dart';
 
 String token(String account) =>
     'a.${base64Url.encode(utf8.encode(jsonEncode({'user_id': account})))}.b';
@@ -413,6 +415,50 @@ void main() {
     expect(manager.session(room(1).id)!.phase, RoomConnectionPhase.running);
     expect(manager.activeConnections, 1);
     expect(runtimes[room(1).id]!.starts, 0);
+  });
+
+  test('startup recovery reconnects persisted opted-in rooms only', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'p2wlan_room_startup_recovery_',
+    );
+    addTearDown(() async => temp.delete(recursive: true));
+    Directory directoryForProfile(String profile) =>
+        Directory('${temp.path}/rooms/$profile');
+    final preferences = RoomConnectionPreferences(
+      persistent: true,
+      directoryForProfile: directoryForProfile,
+    );
+    final first = room(1);
+    final second = room(2);
+    final firstProfile = ParallelRoomPlan(settings, first).profileId;
+    final secondProfile = ParallelRoomPlan(settings, second).profileId;
+    await preferences.update(firstProfile, autoConnect: true, wanted: true);
+    await preferences.update(secondProfile, autoConnect: true, wanted: false);
+
+    final restoredRuntimes = <String, FakeRuntime>{};
+    final restored = ParallelRooms(
+      readSettings: () => settings,
+      supported: true,
+      refreshInterval: Duration.zero,
+      preferences: RoomConnectionPreferences(
+        persistent: true,
+        directoryForProfile: directoryForProfile,
+      ),
+      runtimeFactory: (plan) =>
+          restoredRuntimes[plan.room.id] = FakeRuntime(plan),
+      joinedRoomListLoader: (_) async => [first, second],
+    );
+    addTearDown(() async {
+      await restored.stopAll();
+      restored.dispose();
+    });
+
+    await restored.recoverJoinedRooms();
+
+    expect(restoredRuntimes[first.id]!.starts, 1);
+    expect(restoredRuntimes[second.id]!.starts, 0);
+    expect(restored.session(first.id)!.phase, RoomConnectionPhase.running);
+    expect(restored.session(second.id), isNull);
   });
 
   test('unverified recovered room is retained for cleanup but not counted connected', () async {

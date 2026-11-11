@@ -169,9 +169,8 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     // 127.0.0.1:39277 would manufacture a "local service unavailable" state
     // on every Android/iOS launch.
     final canPollLocalDaemon = _capabilities.canActAsLocalVpnNode;
-    if (widget.autoStartPolling && _authenticated) {
+    if (_authenticated) {
       await _statusStore.parallelRooms.credentialsChanged();
-      unawaited(_statusStore.parallelRooms.recoverJoinedRooms());
     }
     if (widget.autoStartPolling && canPollLocalDaemon) {
       _statusStore.startPolling();
@@ -184,7 +183,10 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       onboardingComplete: !_needsOnboarding,
       canActAsLocalVpnNode: canPollLocalDaemon,
     )) {
-      unawaited(_statusStore.startDaemon());
+      await _statusStore.startDaemon();
+    }
+    if (widget.autoStartPolling && _authenticated) {
+      unawaited(_statusStore.parallelRooms.recoverJoinedRooms());
     }
   }
 
@@ -233,6 +235,37 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
             .updateOpenFailed,
       ),
     );
+  }
+
+  void _onAuthenticated() {
+    if (!mounted) return;
+    setState(() => _authenticated = true);
+    unawaited(_finishAuthentication());
+  }
+
+  Future<void> _finishAuthentication() async {
+    final drained = await _statusStore.parallelRooms.credentialsChanged();
+    if (!drained.ok) return;
+    await _startAfterLoginStartupIfEligible();
+    if (widget.autoStartPolling) {
+      await _statusStore.parallelRooms.recoverJoinedRooms();
+    }
+  }
+
+  Future<void> _startAfterLoginStartupIfEligible() async {
+    final authToken = _settingsStore.settings.authToken.trim();
+    if (!shouldConnectAfterLoginStartup(
+      wasLaunchedAtLogin: widget.connectAfterLoginStartup,
+      hasValidSession:
+          !_settingsStore.settings.manualMode &&
+          authToken.isNotEmpty &&
+          !isAuthTokenExpired(authToken),
+      onboardingComplete: !_needsOnboarding,
+      canActAsLocalVpnNode: _capabilities.canActAsLocalVpnNode,
+    )) {
+      return;
+    }
+    await _statusStore.startDaemon();
   }
 
   bool get _isWindowsTrayNoAdapterExitTest {
@@ -347,7 +380,11 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
                           statusStore: _statusStore,
                           capabilities: _capabilities,
                           onCompleted: () {
-                            if (mounted) setState(() {});
+                            if (!mounted) return;
+                            setState(() {});
+                            if (widget.connectAfterLoginStartup) {
+                              unawaited(_finishOnboarding());
+                            }
                           },
                         )
                       : P2WlanShell(
@@ -366,16 +403,19 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
                     settingsStore: _settingsStore,
                     statusStore: _statusStore,
                     capabilities: _capabilities,
-                    onAuthenticated: () {
-                      if (mounted) {
-                        setState(() => _authenticated = true);
-                      }
-                    },
+                    onAuthenticated: _onAuthenticated,
                   ),
           ),
         );
       },
     );
+  }
+
+  Future<void> _finishOnboarding() async {
+    await _startAfterLoginStartupIfEligible();
+    if (widget.autoStartPolling && _authenticated) {
+      await _statusStore.parallelRooms.recoverJoinedRooms();
+    }
   }
 
   /// Platform capability, decided once. Pages read this rather than branching

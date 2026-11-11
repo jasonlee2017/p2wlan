@@ -65,7 +65,10 @@ class _LoginPageState extends State<LoginPage> {
     // server field visible so the first action is configuration, not a
     // failed login followed by hunting through Advanced options.
     _showAdvanced = settings.controlServer.trim().isEmpty;
-    _emailController = TextEditingController();
+    final savedIdentifier = settings.accountUsername.trim().isNotEmpty
+        ? settings.accountUsername.trim()
+        : settings.accountEmail.trim();
+    _emailController = TextEditingController(text: savedIdentifier);
     _passwordController = TextEditingController();
   }
 
@@ -247,7 +250,9 @@ class _LoginPageState extends State<LoginPage> {
                               ),
                               if (!_register)
                                 TextButton.icon(
-                                  onPressed: _submitting ? null : _showPasswordReset,
+                                  onPressed: _submitting
+                                      ? null
+                                      : _showPasswordReset,
                                   icon: const Icon(Icons.lock_reset_outlined),
                                   label: Text(strings.forgotPassword),
                                 ),
@@ -389,6 +394,21 @@ class _LoginPageState extends State<LoginPage> {
       final settings = widget.settingsStore.settings;
       final accountEmail = session.user?['email']?.toString().trim();
       final accountUsername = session.user?['username']?.toString().trim();
+      final identifier = email.trim();
+      final savedEmail = accountEmail != null && accountEmail.isNotEmpty
+          ? accountEmail.toLowerCase()
+          : identifier.contains('@')
+          ? identifier.toLowerCase()
+          : settings.accountUsername == identifier
+          ? settings.accountEmail
+          : '';
+      final savedUsername = accountUsername != null && accountUsername.isNotEmpty
+          ? accountUsername
+          : !identifier.contains('@')
+          ? identifier
+          : settings.accountEmail.toLowerCase() == identifier.toLowerCase()
+          ? settings.accountUsername
+          : '';
       final deviceName = settings.deviceName.trim().isEmpty
           ? await resolveDefaultDeviceName()
           : settings.deviceName.trim();
@@ -396,10 +416,8 @@ class _LoginPageState extends State<LoginPage> {
         settings.copyWith(
           controlServer: session.controlServer,
           authToken: session.token,
-          accountEmail: accountEmail == null || accountEmail.isEmpty
-              ? (email.contains('@') ? email.trim().toLowerCase() : '')
-              : accountEmail.toLowerCase(),
-          accountUsername: accountUsername ?? settings.accountUsername,
+          accountEmail: savedEmail,
+          accountUsername: savedUsername,
           deviceName: deviceName,
           manualMode: false,
         ),
@@ -461,7 +479,9 @@ class _LoginPageState extends State<LoginPage> {
 
   Future<void> _showPasswordReset() async {
     final strings = AppStringsScope.of(context);
-    final identifierController = TextEditingController(text: _emailController.text.trim());
+    final identifierController = TextEditingController(
+      text: _emailController.text.trim(),
+    );
     final codeController = TextEditingController();
     final passwordController = TextEditingController();
     final confirmController = TextEditingController();
@@ -479,24 +499,54 @@ class _LoginPageState extends State<LoginPage> {
                 children: [
                   Text(strings.resetPasswordHelp),
                   const SizedBox(height: 16),
-                  TextField(controller: identifierController, decoration: InputDecoration(labelText: strings.loginIdentifier)),
+                  TextField(
+                    controller: identifierController,
+                    decoration: InputDecoration(
+                      labelText: strings.loginIdentifier,
+                    ),
+                  ),
                   const SizedBox(height: 10),
-                  TextField(controller: codeController, decoration: InputDecoration(labelText: strings.resetPasswordCode)),
+                  TextField(
+                    controller: codeController,
+                    decoration: InputDecoration(
+                      labelText: strings.resetPasswordCode,
+                    ),
+                  ),
                   const SizedBox(height: 10),
-                  TextField(controller: passwordController, obscureText: true, decoration: InputDecoration(labelText: strings.newPassword)),
+                  TextField(
+                    controller: passwordController,
+                    obscureText: true,
+                    decoration: InputDecoration(labelText: strings.newPassword),
+                  ),
                   const SizedBox(height: 10),
-                  TextField(controller: confirmController, obscureText: true, decoration: InputDecoration(labelText: strings.confirmPassword)),
+                  TextField(
+                    controller: confirmController,
+                    obscureText: true,
+                    decoration: InputDecoration(
+                      labelText: strings.confirmPassword,
+                    ),
+                  ),
                 ],
               ),
             ),
             actions: [
-              TextButton(onPressed: submitting ? null : () => Navigator.pop(dialogContext), child: Text(strings.cancel)),
+              TextButton(
+                onPressed: submitting
+                    ? null
+                    : () => Navigator.pop(dialogContext),
+                child: Text(strings.cancel),
+              ),
               FilledButton.icon(
                 onPressed: submitting
                     ? null
                     : () async {
                         if (passwordController.text != confirmController.text) {
-                          _presentError(_LoginError(title: strings.passwordResetFailed, body: strings.passwordResetMismatch));
+                          _presentError(
+                            _LoginError(
+                              title: strings.passwordResetFailed,
+                              body: strings.passwordResetMismatch,
+                            ),
+                          );
                           return;
                         }
                         setDialogState(() => submitting = true);
@@ -507,16 +557,29 @@ class _LoginPageState extends State<LoginPage> {
                             code: codeController.text,
                             password: passwordController.text,
                           );
-                          if (dialogContext.mounted) Navigator.pop(dialogContext);
+                          if (dialogContext.mounted) {
+                            Navigator.pop(dialogContext);
+                          }
                           if (mounted) {
-                            _emailController.text = identifierController.text.trim();
+                            _emailController.text = identifierController.text
+                                .trim();
                             _passwordController.clear();
-                            _presentError(_LoginError(title: strings.resetPasswordTitle, body: strings.passwordResetSuccess, tone: _LoginErrorTone.success));
+                            _presentError(
+                              _LoginError(
+                                title: strings.resetPasswordTitle,
+                                body: strings.passwordResetSuccess,
+                                tone: _LoginErrorTone.success,
+                              ),
+                            );
                           }
                         } catch (error) {
-                          if (mounted) _presentError(_errorTextFor(strings, error));
+                          if (mounted) {
+                            _presentError(_errorTextFor(strings, error));
+                          }
                         } finally {
-                          if (dialogContext.mounted) setDialogState(() => submitting = false);
+                          if (dialogContext.mounted) {
+                            setDialogState(() => submitting = false);
+                          }
                         }
                       },
                 icon: const Icon(Icons.lock_reset_outlined),
@@ -603,7 +666,6 @@ _LoginError _errorTextFor(AppStrings strings, Object error) {
       return _LoginError(title: strings.loginErrorUnknownTitle);
   }
 }
-
 
 class _LoginError {
   const _LoginError({

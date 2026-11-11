@@ -68,6 +68,9 @@ class ParallelRoomSession {
 }
 
 typedef RoomRuntimeFactory = RoomRuntime Function(ParallelRoomPlan plan);
+typedef JoinedRoomListLoader = Future<List<FriendRoom>> Function(
+  AppSettings account,
+);
 
 class ParallelRooms extends ChangeNotifier {
   ParallelRooms({
@@ -75,6 +78,7 @@ class ParallelRooms extends ChangeNotifier {
     required this.runtimeFactory,
     bool? supported,
     RoomConnectionPreferences? preferences,
+    this.joinedRoomListLoader,
     this.maxConnections = 8,
     this.refreshInterval = const Duration(seconds: 5),
   }) : preferences = preferences ?? RoomConnectionPreferences(),
@@ -89,6 +93,7 @@ class ParallelRooms extends ChangeNotifier {
       Platform.isWindows || Platform.isMacOS || Platform.isLinux;
 
   final RoomConnectionPreferences preferences;
+  final JoinedRoomListLoader? joinedRoomListLoader;
   final AppSettings Function() readSettings;
   final RoomRuntimeFactory runtimeFactory;
   final bool supported;
@@ -236,7 +241,7 @@ class ParallelRooms extends ChangeNotifier {
 
   Future<DaemonCommandResult> credentialsChanged() {
     final next = _credentialKey(readSettings());
-    if (next == _credentials) return Future.value(_ok());
+    if (next == _credentials) return _stoppingAll ?? Future.value(_ok());
     _credentials = next;
     _epoch++;
     _recentRoomPlans.clear();
@@ -574,10 +579,10 @@ class ParallelRooms extends ChangeNotifier {
     }
     final account = readSettings();
     if (account.authToken.trim().isEmpty) return;
-    RoomApi? api;
     try {
-      api = RoomApi(server: account.controlServer, token: account.authToken);
-      final rooms = await api.list();
+      final rooms =
+          await (joinedRoomListLoader?.call(account) ??
+              _loadJoinedRooms(account));
       if (_credentialKey(account) != _credentialKey(readSettings())) return;
       for (final room in rooms) {
         await recover(room);
@@ -592,8 +597,18 @@ class ParallelRooms extends ChangeNotifier {
     } catch (_) {
       lastError = '无法恢复房间运行时，请检查登录和控制服务器';
       _notify();
+    }
+  }
+
+  Future<List<FriendRoom>> _loadJoinedRooms(AppSettings account) async {
+    final api = RoomApi(
+      server: account.controlServer,
+      token: account.authToken,
+    );
+    try {
+      return await api.list();
     } finally {
-      api?.close();
+      api.close();
     }
   }
 

@@ -11,6 +11,8 @@
 
 import 'dart:io';
 
+import 'package:flutter_secure_storage_windows/flutter_secure_storage_windows.dart';
+
 import '../platform/android_platform.dart';
 
 abstract interface class SecureTokenRepository {
@@ -41,10 +43,23 @@ class SecureTokenStorageException implements Exception {
 /// are restricted to the current user (`0700`/`0600`). Windows app-data is
 /// already scoped to the current user by the OS profile.
 class LocalTokenRepository implements SecureTokenRepository {
-  LocalTokenRepository({File? file}) : _fileOverride = file;
+  LocalTokenRepository({
+    File? file,
+    this.legacyWindowsTokenReader,
+    this.legacyWindowsTokenClearer,
+    bool? isWindows,
+  }) : _fileOverride = file,
+       _isWindows = isWindows ?? Platform.isWindows;
 
   static const _fileName = 'p2wlan-auth-token';
+  static const _legacyWindowsTokenKey = 'p2wlan.control.auth_token';
+  static const _legacyWindowsStorageOptions = {
+    'useBackwardCompatibility': 'true',
+  };
   final File? _fileOverride;
+  final LegacyWindowsTokenReader? legacyWindowsTokenReader;
+  final LegacyWindowsTokenClearer? legacyWindowsTokenClearer;
+  final bool _isWindows;
 
   File _tokenFileSync() {
     final override = _fileOverride;
@@ -128,14 +143,40 @@ class LocalTokenRepository implements SecureTokenRepository {
   Future<String?> read() async {
     try {
       final file = Platform.isAndroid ? await _tokenFile() : _tokenFileSync();
+      if (await file.exists()) {
+        final token = (await file.readAsString()).trim();
+        if (token.isNotEmpty) return token;
+      }
+
+      if (_isWindows &&
+          (_fileOverride == null || legacyWindowsTokenReader != null)) {
+        final legacy = (legacyWindowsTokenReader ?? _readLegacyWindowsToken);
+        final token = (await legacy())?.trim() ?? '';
+        if (token.isNotEmpty) {
+          await _writeFile(file, token);
+          if ((await file.readAsString()).trim() != token) {
+            throw const SecureTokenStorageException('Windows 旧版登录凭据迁移校验失败。');
+          }
+          if (_fileOverride == null || legacyWindowsTokenClearer != null) {
+            try {
+              await (legacyWindowsTokenClearer ??
+                  _clearLegacyWindowsToken)();
+            } on Object {
+              // The verified local copy remains authoritative if legacy
+              // cleanup is unavailable. A later read will use that copy.
+            }
+          }
+          return token;
+        }
+      }
+
       var source = file;
       if (!await source.exists()) {
         final legacy = _legacyAndroidTokenFile();
         if (legacy == null || !await legacy.exists()) return null;
         source = legacy;
       }
-      final value = await source.readAsString();
-      final trimmed = value.trim();
+      final trimmed = (await source.readAsString()).trim();
       if (trimmed.isNotEmpty && source.path != file.path) {
         // One-time migration from the old cache/temp location used by older
         // Android builds. Keep the old file untouched so an interrupted
@@ -143,6 +184,8 @@ class LocalTokenRepository implements SecureTokenRepository {
         await _writeFile(file, trimmed);
       }
       return trimmed.isEmpty ? null : trimmed;
+    } on SecureTokenStorageException {
+      rethrow;
     } catch (_) {
       throw const SecureTokenStorageException('本地凭据文件不可用，无法读取 P2WLAN 登录凭据。');
     }
@@ -172,8 +215,36 @@ class LocalTokenRepository implements SecureTokenRepository {
       if (await file.exists()) await file.delete();
       final legacy = _legacyAndroidTokenFile();
       if (legacy != null && await legacy.exists()) await legacy.delete();
+      if (_isWindows &&
+          (_fileOverride == null || legacyWindowsTokenClearer != null)) {
+        await (legacyWindowsTokenClearer ?? _clearLegacyWindowsToken)();
+      }
     } catch (_) {
       throw const SecureTokenStorageException('本地凭据文件不可用，未能删除 P2WLAN 登录凭据。');
+    }
+  }
+
+  Future<String?> _readLegacyWindowsToken() async {
+    try {
+      final value = await FlutterSecureStorageWindows().read(
+        key: _legacyWindowsTokenKey,
+        options: _legacyWindowsStorageOptions,
+      );
+      final token = value?.trim() ?? '';
+      return token.isEmpty ? null : token;
+    } catch (_) {
+      throw const SecureTokenStorageException('无法读取旧版 Windows 登录凭据。');
+    }
+  }
+
+  Future<void> _clearLegacyWindowsToken() async {
+    try {
+      await FlutterSecureStorageWindows().delete(
+        key: _legacyWindowsTokenKey,
+        options: _legacyWindowsStorageOptions,
+      );
+    } catch (_) {
+      throw const SecureTokenStorageException('无法清除旧版 Windows 登录凭据。');
     }
   }
 
@@ -201,6 +272,9 @@ class LocalTokenRepository implements SecureTokenRepository {
     }
   }
 }
+
+typedef LegacyWindowsTokenReader = Future<String?> Function();
+typedef LegacyWindowsTokenClearer = Future<void> Function();
 
 /// In-memory implementation for tests.
 class InMemorySecureTokenRepository implements SecureTokenRepository {

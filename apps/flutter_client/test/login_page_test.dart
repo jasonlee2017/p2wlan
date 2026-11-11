@@ -20,15 +20,11 @@ import 'package:p2wlan_flutter_client/features/auth/login_page.dart';
 void main() {
   test('pending account responses use the activation-required category', () {
     expect(
-      loginErrorKindOf(
-        const ControlApiException('注册成功，等待服务器管理员激活后才能登录'),
-      ),
+      loginErrorKindOf(const ControlApiException('注册成功，等待服务器管理员激活后才能登录')),
       LoginErrorKind.registrationPending,
     );
     expect(
-      loginErrorKindOf(
-        const ControlApiException('账号已注册，等待服务器管理员激活后才能连接'),
-      ),
+      loginErrorKindOf(const ControlApiException('账号已注册，等待服务器管理员激活后才能连接')),
       LoginErrorKind.registrationPending,
     );
   });
@@ -89,6 +85,26 @@ void main() {
     expect(find.text('Advanced options'), findsOneWidget);
     expect(find.text('Self-hosted server'), findsOneWidget);
     expect(find.text('Continue in manual / offline mode'), findsOneWidget);
+  });
+
+  testWidgets('login identifier is restored from saved account identity', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(_makeStores))!;
+    addTearDown(stores.dispose);
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(
+          accountEmail: 'saved@example.com',
+          accountUsername: 'saved-user',
+        ),
+      ),
+    );
+
+    await _pumpLogin(tester, stores);
+
+    final identifier = tester.widget<TextField>(find.byType(TextField).first);
+    expect(identifier.controller!.text, 'saved-user');
   });
 
   testWidgets('sign in requires an explicitly configured control server', (
@@ -255,37 +271,35 @@ void main() {
     expect(find.textContaining('邮箱'), findsNothing);
   });
 
-  testWidgets('registration pending explains that administrator activation is required', (
-    tester,
-  ) async {
-    final stores = (await tester.runAsync(_makeStores))!;
-    addTearDown(stores.dispose);
-    final fake = _FakeControlApi(
-      error: const ControlApiException('注册成功，等待服务器管理员激活后才能登录'),
-    );
+  testWidgets(
+    'registration pending explains that administrator activation is required',
+    (tester) async {
+      final stores = (await tester.runAsync(_makeStores))!;
+      addTearDown(stores.dispose);
+      final fake = _FakeControlApi(
+        error: const ControlApiException('注册成功，等待服务器管理员激活后才能登录'),
+      );
 
-    await _pumpLogin(
-      tester,
-      stores,
-      controlApi: fake,
-      controlServer: 'https://control.example.com',
-      languageCode: 'zh-Hans',
-    );
-    await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
-    await tester.tap(find.text('没有账号？创建账号'));
-    await tester.pumpAndSettle();
-    await tester.enterText(find.byType(TextField).at(1), 'secret123');
-    await tester.tap(find.text('创建账号'));
-    await _waitFor(tester, () => fake.authenticateCalls == 1);
-    await tester.pumpAndSettle();
+      await _pumpLogin(
+        tester,
+        stores,
+        controlApi: fake,
+        controlServer: 'https://control.example.com',
+        languageCode: 'zh-Hans',
+      );
+      await tester.enterText(find.byType(TextField).at(0), 'a@example.com');
+      await tester.tap(find.text('没有账号？创建账号'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).at(1), 'secret123');
+      await tester.tap(find.text('创建账号'));
+      await _waitFor(tester, () => fake.authenticateCalls == 1);
+      await tester.pumpAndSettle();
 
-    expect(find.text('注册成功'), findsOneWidget);
-    expect(
-      find.text('账号已创建，请等待服务器管理员激活后再登录。'),
-      findsOneWidget,
-    );
-    expect(find.text('注册失败，请稍后重试。'), findsNothing);
-  });
+      expect(find.text('注册成功'), findsOneWidget);
+      expect(find.text('账号已创建，请等待服务器管理员激活后再登录。'), findsOneWidget);
+      expect(find.text('注册失败，请稍后重试。'), findsNothing);
+    },
+  );
 
   testWidgets('network failures map to reachability message', (tester) async {
     final stores = (await tester.runAsync(_makeStores))!;
@@ -419,6 +433,42 @@ void main() {
     expect(find.textContaining('test-token'), findsNothing);
   });
 
+  testWidgets('username login identifier is retained when profile omits it', (
+    tester,
+  ) async {
+    final stores = (await tester.runAsync(_makeStores))!;
+    addTearDown(stores.dispose);
+    await tester.runAsync(
+      () => stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(
+          accountEmail: 'previous@example.com',
+          accountUsername: 'previous-user',
+        ),
+      ),
+    );
+    var authenticated = false;
+
+    await _pumpLogin(
+      tester,
+      stores,
+      controlApi: _FakeControlApi(
+        session: const AuthSession(
+          token: 'test-token',
+          controlServer: 'https://cs.example.com',
+        ),
+      ),
+      controlServer: 'https://control.example.com',
+      onAuthenticated: () => authenticated = true,
+    );
+    await tester.enterText(find.byType(TextField).at(0), 'new-user');
+    await tester.enterText(find.byType(TextField).at(1), 'secret123');
+    await tester.tap(find.text('Sign in'));
+    await _waitFor(tester, () => authenticated);
+
+    expect(stores.settingsStore.settings.accountUsername, 'new-user');
+    expect(stores.settingsStore.settings.accountEmail, '');
+  });
+
   testWidgets('manual / offline mode clears token and proceeds', (
     tester,
   ) async {
@@ -545,15 +595,12 @@ void main() {
     await tester.pump();
 
     await tester.pumpWidget(const SizedBox.shrink());
-    fake.completer!.complete(
-      const AuthSession(
-        token: 'test-token',
-        controlServer: 'https://control.example.com',
-      ),
+    fake.completer!.completeError(
+      const ControlApiException('登录失败'),
     );
-    await tester.runAsync(
-      () => Future<void>.delayed(const Duration(milliseconds: 20)),
-    );
+    await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    });
     await tester.pump();
 
     expect(tester.takeException(), isNull);
