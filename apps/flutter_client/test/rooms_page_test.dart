@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:p2wlan_flutter_client/app/navigation.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 import 'package:p2wlan_flutter_client/core/rooms/parallel_rooms.dart';
+import 'package:p2wlan_flutter_client/core/rooms/room_connection_preferences.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/capabilities/platform_capabilities.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
@@ -197,6 +198,9 @@ void main() {
     bool enterRoom = true,
     bool enableDaemonPolling = false,
     bool controls = false,
+    bool supportParallelRooms = false,
+    String platform = 'ios',
+    RoomConnectionPreferences? roomPreferences,
     void Function(VoidCallback)? onStatusPulse,
   }) async {
     final dir = await tester.runAsync(
@@ -218,11 +222,12 @@ void main() {
     });
     final parallel = ParallelRooms(
       readSettings: () => settings.settings,
-      supported: snapshot != null,
+      supported: snapshot != null || supportParallelRooms,
       refreshInterval: enableDaemonPolling
           ? const Duration(seconds: 5)
           : Duration.zero,
-      runtimeFactory: (_) => _RoomRuntime(snapshot!),
+      runtimeFactory: (_) => _RoomRuntime(snapshot ?? _snapshot()),
+      preferences: roomPreferences,
     );
     if (snapshot != null) {
       await parallel.connect(FriendRoom.fromJson(_room(role)));
@@ -248,13 +253,13 @@ void main() {
                 settingsStore: settings,
                 statusStore: status,
                 roomInvitation: invitation,
-                capabilities: PlatformCapabilities.fromPlatform('ios'),
+                capabilities: PlatformCapabilities.fromPlatform(platform),
               )
             : RoomsPage(
                 settingsStore: settings,
                 statusStore: status,
                 api: api,
-                capabilities: PlatformCapabilities.fromPlatform('ios'),
+                capabilities: PlatformCapabilities.fromPlatform(platform),
                 initialInvitation: invitation,
               ),
       ),
@@ -305,6 +310,55 @@ void main() {
     );
     await tester.pumpWidget(const SizedBox.shrink());
   });
+
+  testWidgets(
+    'paused room auto-connect is shown as off with recovery guidance',
+    (tester) async {
+      final preferences = RoomConnectionPreferences();
+      final room = FriendRoom.fromJson(_room('owner'));
+      final profile = ParallelRoomPlan(
+        AppSettings(
+          controlServer: 'https://control.example',
+          authToken: _token,
+        ),
+        room,
+      ).profileId;
+      await preferences.update(profile, autoConnect: true, wanted: false);
+
+      await pump(
+        tester,
+        role: 'owner',
+        supportParallelRooms: true,
+        platform: 'windows',
+        roomPreferences: preferences,
+      );
+
+      final tile = tester.widget<SwitchListTile>(
+        find.ancestor(
+          of: find.text('启动时自动连接此房间'),
+          matching: find.byType(SwitchListTile),
+        ),
+      );
+      expect(tile.value, isFalse);
+      expect(tile.subtitle, isA<Text>());
+      expect((tile.subtitle! as Text).data, contains('自动连接已暂停'));
+      await tester.tap(find.text('启动时自动连接此房间'));
+      await tester.pumpAndSettle();
+      final reenabledTile = tester.widget<SwitchListTile>(
+        find.ancestor(
+          of: find.text('启动时自动连接此房间'),
+          matching: find.byType(SwitchListTile),
+        ),
+      );
+      expect(reenabledTile.value, isTrue);
+      expect(
+        (await preferences.read(profile)).wanted,
+        isTrue,
+        reason: 're-enabling auto-connect restores this device intent',
+      );
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
 
   testWidgets(
     'stable room refresh is not starved by one-second status notifications',

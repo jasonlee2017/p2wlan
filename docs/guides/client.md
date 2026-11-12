@@ -27,7 +27,7 @@ macOS 和 Linux 桌面启动会先准备当前实例的配置、日志目录，�
 
 Windows、macOS 和 Linux 桌面客户端可在“设置 → 通用 → 登录时启动 P2WLAN”中选择是否在当前用户进入桌面会话后自动启动应用，并在登录状态、首次配置和本机 VPN 能力均有效时连接已配置的 P2WLAN 网络。手动启动应用不会隐式连接网络。
 
-客户端会保存账号标识和认证会话以便下次恢复登录，不保存账号密码。Control 账号会话默认有效 7 天；会话过期或密码重置使会话失效后，需要重新输入密码。重新登录成功后，已启用的房间自动连接也会恢复。
+客户端会保存账号标识和认证会话以便下次恢复登录，不保存账号密码。Control 账号会话默认有效 7 天；会话过期或密码重置使会话失效后，需要重新输入密码。桌面端在房间设置中开启“启动时自动连接此房间”后，登录、自启或重新登录时会恢复本机仍保持连接意图的房间；手动或远程断开会暂停该房间的自动连接。设置页会把暂停状态显示为关闭，重新开启可恢复后续自动连接；点击“连接本机”可立即连接。
 
 登录自启只写入当前用户范围：Windows 使用 `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`，macOS 使用 `~/Library/LaunchAgents/io.p2wlan.desktop.login-startup.plist`，Linux 使用 XDG Autostart（`$XDG_CONFIG_HOME/autostart/p2wlan.desktop`，未设置绝对的 `XDG_CONFIG_HOME` 时回退到 `~/.config/autostart/p2wlan.desktop`）。关闭开关会移除对应当前用户条目，不创建系统级服务。
 

@@ -53,6 +53,7 @@ class _RoomsPageState extends State<RoomsPage> {
   final Map<String, RoomRoster> _rosters = {};
   final _localIdentities = <String, Map<String, String>>{};
   final _autoConnect = <String, bool>{};
+  final _autoConnectPaused = <String, bool>{};
   List<Map<String, dynamic>> _invites = [];
   String? _selectedId;
   String? _error;
@@ -243,7 +244,10 @@ class _RoomsPageState extends State<RoomsPage> {
       final roster = id == null ? null : await _api.roster(id);
       if (roster != null && _parallel.supported && _canConnect) {
         final preference = await _parallel.connectionPreference(roster.room);
-        _autoConnect[roster.room.id] = preference.autoConnect;
+        _autoConnect[roster.room.id] =
+            preference.autoConnect && preference.wanted;
+        _autoConnectPaused[roster.room.id] =
+            preference.autoConnect && !preference.wanted;
       }
       if (roster != null && _canConnect) {
         unawaited(_loadLocalIdentity(roster.room));
@@ -1519,7 +1523,8 @@ class _RoomsPageState extends State<RoomsPage> {
         primaryConnected ||
         (connection?.phase == RoomConnectionPhase.running &&
             connection?.snapshot != null);
-    final pending = connection != null &&
+    final pending =
+        connection != null &&
         (connection.phase == RoomConnectionPhase.starting ||
             connection.phase == RoomConnectionPhase.stopping);
     final retryCleanup =
@@ -1672,13 +1677,18 @@ class _RoomsPageState extends State<RoomsPage> {
         if (_parallel.supported && _canConnect)
           SwitchListTile.adaptive(
             title: const Text('启动时自动连接此房间'),
-            subtitle: const Text('仅对本机生效；手动或远程断开后，需重新手动连接'),
+            subtitle: Text(
+              _autoConnectPaused[room.id] == true
+                  ? '自动连接已暂停。重新开启以恢复下次启动连接；点“连接本机”可立即连接。'
+                  : '仅对本机生效；手动或远程断开后，需手动恢复连接。',
+            ),
             value: _autoConnect[room.id] ?? false,
             onChanged: _busy
                 ? null
                 : (value) => _run(() async {
                     await _parallel.setAutoConnect(room, value);
                     _autoConnect[room.id] = value;
+                    _autoConnectPaused[room.id] = false;
                   }),
           ),
         const SizedBox(height: 16),
