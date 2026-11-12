@@ -38,6 +38,9 @@ class FakeRuntime implements RoomRuntime {
   bool wrongNetwork = false;
   Completer<void>? startGate;
   Completer<void>? stopGate;
+  Completer<void>? statusEntered;
+  Completer<void>? statusGate;
+  Object? statusError;
 
   @override
   Future<bool> exists() async {
@@ -66,6 +69,11 @@ class FakeRuntime implements RoomRuntime {
 
   @override
   Future<DiagnosticsSnapshot> status() async {
+    if (statusEntered != null && !statusEntered!.isCompleted) {
+      statusEntered!.complete();
+    }
+    await statusGate?.future;
+    if (statusError != null) throw statusError!;
     if (failStatus) throw StateError('unavailable');
     return DiagnosticsSnapshot.fromJson({
       'network_id': wrongNetwork ? room(200).id : plan.room.id,
@@ -360,6 +368,26 @@ void main() {
       expect(manager.sessions, isEmpty);
     },
   );
+
+  test('shutdown race preserves automatic room connection intent', () async {
+    final entered = Completer<void>();
+    final gate = Completer<void>();
+    configure = (runtime) {
+      runtime.statusEntered = entered;
+      runtime.statusGate = gate;
+      runtime.statusError = const RoomConnectionStopped('daemon stopping');
+    };
+    await manager.setAutoConnect(room(1), true);
+
+    final connecting = manager.connect(room(1));
+    await entered.future;
+    final stopping = manager.stopAll();
+    gate.complete();
+
+    expect((await connecting).ok, isFalse);
+    expect((await stopping).ok, isTrue);
+    expect((await manager.connectionPreference(room(1))).wanted, isTrue);
+  });
 
   test(
     'global shutdown keeps admission closed while primary daemon drains',

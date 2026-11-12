@@ -351,6 +351,12 @@ class ParallelRooms extends ChangeNotifier {
       epoch == _epoch &&
       credentials == _credentialKey(readSettings());
 
+  // Shutdown and account transitions intentionally stop room daemons while
+  // retaining the user's automatic-connection intent for the next startup.
+  // Only a live, user-visible connection failure may clear `wanted`.
+  bool _mayClearConnectionIntent() =>
+      !_disposed && _stoppingAll == null && !connectionsPaused;
+
   Future<DaemonCommandResult> _connect(
     FriendRoom room,
     int epoch,
@@ -419,7 +425,7 @@ class ParallelRooms extends ChangeNotifier {
           ? await entry.runtime.start()
           : _fail('登录状态已变化，连接已取消');
     } catch (error) {
-      if (error is RoomConnectionStopped) {
+      if (error is RoomConnectionStopped && _mayClearConnectionIntent()) {
         try {
           await preferences.update(plan.profileId, wanted: false);
         } catch (_) {
@@ -736,7 +742,7 @@ class ParallelRooms extends ChangeNotifier {
       );
     } catch (error) {
       if (error is RoomConnectionStopped &&
-          !_disposed &&
+          _mayClearConnectionIntent() &&
           revision == entry.revision &&
           identical(_sessions[entry.plan.room.id], entry)) {
         var message = error.message;
