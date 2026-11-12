@@ -252,8 +252,14 @@ void main() {
           } catch (_) {}
         }
       });
-      final stdoutFuture = process.stdout.transform(utf8.decoder).join();
-      final stderrFuture = process.stderr.transform(utf8.decoder).join();
+      // Windows daemon logs may use the active console code page. The test
+      // only includes output when reporting a failure, so decode lossily.
+      final stdoutFuture = process.stdout
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .join();
+      final stderrFuture = process.stderr
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .join();
 
       await _waitForWindowsDaemonHealth(port);
       await _waitForNonEmptyFile(auth);
