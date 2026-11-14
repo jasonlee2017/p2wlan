@@ -11,7 +11,12 @@ class RoomException implements Exception {
 }
 
 class RoomConnectionStopped extends RoomException {
-  const RoomConnectionStopped(super.message);
+  const RoomConnectionStopped(
+    super.message, {
+    this.clearAutoConnectIntent = false,
+  });
+
+  final bool clearAutoConnectIntent;
 }
 
 String roomControlServer(String value) {

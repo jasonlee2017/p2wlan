@@ -489,6 +489,72 @@ void main() {
     expect(restored.session(second.id), isNull);
   });
 
+  test('startup retries after a local room daemon exits', () async {
+    final temp = await Directory.systemTemp.createTemp(
+      'p2wlan_room_startup_retry_',
+    );
+    addTearDown(() async => temp.delete(recursive: true));
+    Directory directoryForProfile(String profile) =>
+        Directory('${temp.path}/rooms/$profile');
+    final targetRoom = room(1);
+    final profile = ParallelRoomPlan(settings, targetRoom).profileId;
+    final preferences = RoomConnectionPreferences(
+      persistent: true,
+      directoryForProfile: directoryForProfile,
+    );
+    await preferences.update(profile, autoConnect: true, wanted: true);
+
+    final failedRuntime = <String, FakeRuntime>{};
+    final failedStartup = ParallelRooms(
+      readSettings: () => settings,
+      supported: true,
+      refreshInterval: Duration.zero,
+      preferences: preferences,
+      runtimeFactory: (plan) {
+        final runtime = FakeRuntime(plan)
+          ..statusError = const RoomConnectionStopped('本机房间服务已退出');
+        failedRuntime[plan.room.id] = runtime;
+        return runtime;
+      },
+      joinedRoomListLoader: (_) async => [targetRoom],
+    );
+    addTearDown(() async {
+      await failedStartup.stopAll();
+      failedStartup.dispose();
+    });
+
+    await failedStartup.recoverJoinedRooms();
+
+    expect(failedRuntime[targetRoom.id]!.starts, 1);
+    expect((await preferences.read(profile)).wanted, isTrue);
+
+    final nextStartupRuntime = <String, FakeRuntime>{};
+    final nextStartup = ParallelRooms(
+      readSettings: () => settings,
+      supported: true,
+      refreshInterval: Duration.zero,
+      preferences: RoomConnectionPreferences(
+        persistent: true,
+        directoryForProfile: directoryForProfile,
+      ),
+      runtimeFactory: (plan) =>
+          nextStartupRuntime[plan.room.id] = FakeRuntime(plan),
+      joinedRoomListLoader: (_) async => [targetRoom],
+    );
+    addTearDown(() async {
+      await nextStartup.stopAll();
+      nextStartup.dispose();
+    });
+
+    await nextStartup.recoverJoinedRooms();
+
+    expect(nextStartupRuntime[targetRoom.id]!.starts, 1);
+    expect(
+      nextStartup.session(targetRoom.id)!.phase,
+      RoomConnectionPhase.running,
+    );
+  });
+
   test('unverified recovered room is retained for cleanup but not counted connected', () async {
     configure = (runtime) => runtime.failExists = true;
     await manager.recover(room(1));

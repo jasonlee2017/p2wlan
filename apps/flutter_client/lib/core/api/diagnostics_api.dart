@@ -29,6 +29,7 @@ class DiagnosticsApi {
   ];
 
   final HttpClient _client;
+  HttpClient? _healthClient;
   final Future<String?> Function() _authTokenReader;
   final _healthFailures = <String, DiagnosticsApiException>{};
   HttpClientRequest? _speedTestRequest;
@@ -40,11 +41,16 @@ class DiagnosticsApi {
 
   Future<bool> fetchHealth(String diagnosticsUrl) async {
     try {
-      final body = await _getText(
-        _endpoint(diagnosticsUrl, '/health'),
-        'text/plain',
-        authorize: false,
-      ).timeout(_requestTimeout);
+      final healthClient = _healthClient ??= HttpClient()
+        ..connectionTimeout = _requestTimeout
+        ..findProxy = null;
+      final request = await healthClient
+          .getUrl(_endpoint(diagnosticsUrl, '/health'))
+          .timeout(_requestTimeout);
+      request.headers.set(HttpHeaders.acceptHeader, 'text/plain');
+      request.headers.set(HttpHeaders.connectionHeader, 'close');
+      final response = await _closeRequest(request, _requestTimeout);
+      final body = await utf8.decodeStream(response).timeout(_requestTimeout);
       if (body.trim() != 'ok') {
         throw const DiagnosticsApiException(
           'GET /health returned an unexpected response',
@@ -73,6 +79,8 @@ class DiagnosticsApi {
           reasonCode: 'health_read_failed',
         ),
       };
+      _healthClient?.close(force: true);
+      _healthClient = null;
       if (_healthFailures.length >= 8) _healthFailures.clear();
       _healthFailures[diagnosticsUrl] = failure;
       return false;
@@ -328,12 +336,14 @@ class DiagnosticsApi {
     Uri uri,
     String accept, {
     bool authorize = true,
+    bool closeConnection = false,
   }) async {
     return _getTextWithTimeout(
       uri,
       accept,
       _requestTimeout,
       authorize: authorize,
+      closeConnection: closeConnection,
     );
   }
 
@@ -349,10 +359,14 @@ class DiagnosticsApi {
     String accept,
     Duration timeout, {
     bool authorize = true,
+    bool closeConnection = false,
   }) async {
     for (var attempt = 0; attempt <= _authRetryDelays.length; attempt++) {
       final request = await _client.getUrl(uri).timeout(timeout);
       request.headers.set(HttpHeaders.acceptHeader, accept);
+      if (closeConnection) {
+        request.headers.set(HttpHeaders.connectionHeader, 'close');
+      }
       HttpClientResponse response;
       String body;
       try {
@@ -421,6 +435,8 @@ class DiagnosticsApi {
   void close() {
     cancelSpeedTest();
     _healthFailures.clear();
+    _healthClient?.close(force: true);
+    _healthClient = null;
     _client.close(force: true);
   }
 }

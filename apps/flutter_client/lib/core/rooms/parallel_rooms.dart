@@ -425,7 +425,9 @@ class ParallelRooms extends ChangeNotifier {
           ? await entry.runtime.start()
           : _fail('登录状态已变化，连接已取消');
     } catch (error) {
-      if (error is RoomConnectionStopped && _mayClearConnectionIntent()) {
+      if (error is RoomConnectionStopped &&
+          error.clearAutoConnectIntent &&
+          _mayClearConnectionIntent()) {
         try {
           await preferences.update(plan.profileId, wanted: false);
         } catch (_) {
@@ -741,10 +743,44 @@ class ParallelRooms extends ChangeNotifier {
         message: entry.message,
       );
     } catch (error) {
-      if (error is RoomConnectionStopped &&
-          _mayClearConnectionIntent() &&
+      bool isCurrentEntry() =>
+          !_disposed &&
           revision == entry.revision &&
-          identical(_sessions[entry.plan.room.id], entry)) {
+          identical(_sessions[entry.plan.room.id], entry);
+
+      if (isCurrentEntry() &&
+          (entry.lastSuccessfulRefreshAt != null ||
+              error is RoomConnectionStopped)) {
+        var runtimePresent = true;
+        var runtimeKnown = false;
+        try {
+          runtimePresent = await entry.runtime.exists();
+          runtimeKnown = true;
+        } catch (_) {
+          // Keep ownership when the process identity cannot be verified.
+        }
+        if (runtimeKnown && !runtimePresent && isCurrentEntry()) {
+          entry.message = '本机房间服务已退出，正在清理连接状态';
+          if (error is RoomConnectionStopped &&
+              error.clearAutoConnectIntent &&
+              _mayClearConnectionIntent()) {
+            try {
+              await preferences.update(entry.plan.profileId, wanted: false);
+            } catch (_) {
+              entry.message = '${entry.message}；无法保存本地自动连接设置';
+            }
+          }
+          final stopped = await _disconnect(entry.plan.room.id);
+          if (stopped.ok) {
+            lastError = '本机房间服务已退出，连接已停止；下次启动将重试自动连接';
+            return;
+          }
+        }
+      }
+      if (error is RoomConnectionStopped &&
+          error.clearAutoConnectIntent &&
+          _mayClearConnectionIntent() &&
+          isCurrentEntry()) {
         var message = error.message;
         try {
           await preferences.update(entry.plan.profileId, wanted: false);
@@ -756,34 +792,7 @@ class ParallelRooms extends ChangeNotifier {
         lastError = message;
         return;
       }
-      if (entry.lastSuccessfulRefreshAt != null &&
-          !_disposed &&
-          revision == entry.revision &&
-          identical(_sessions[entry.plan.room.id], entry)) {
-        var runtimePresent = true;
-        var runtimeKnown = false;
-        try {
-          runtimePresent = await entry.runtime.exists();
-          runtimeKnown = true;
-        } catch (_) {
-          // Keep ownership when the process identity cannot be verified.
-        }
-        if (runtimeKnown &&
-            !runtimePresent &&
-            !_disposed &&
-            revision == entry.revision &&
-            identical(_sessions[entry.plan.room.id], entry)) {
-          entry.message = '本机房间服务已退出，正在清理连接状态';
-          final stopped = await _disconnect(entry.plan.room.id);
-          if (stopped.ok) {
-            lastError = '本机房间服务已退出，连接已停止，可重新连接';
-            return;
-          }
-        }
-      }
-      if (!_disposed &&
-          revision == entry.revision &&
-          identical(_sessions[entry.plan.room.id], entry)) {
+      if (isCurrentEntry()) {
         final lastSuccess = entry.lastSuccessfulRefreshAt;
         final retainSnapshot =
             entry.snapshot != null &&

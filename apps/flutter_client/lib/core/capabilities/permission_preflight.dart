@@ -140,6 +140,34 @@ Future<PermissionPreflight> runPermissionPreflight() async {
   );
 }
 
+/// Windows administrators can run with a filtered, medium-integrity token.
+/// Membership in the Administrators group alone is therefore insufficient to
+/// decide whether the daemon may create Wintun and install routes.
+Future<bool> isWindowsElevatedToken() async {
+  if (!Platform.isWindows) return false;
+  try {
+    final windir = Platform.environment['WINDIR']?.trim();
+    final executable = windir == null || windir.isEmpty
+        ? 'powershell.exe'
+        : '$windir\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+    final result = await Process.run(executable, [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-WindowStyle',
+      'Hidden',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      r"$groups = @(whoami.exe /groups /fo csv /nh); [bool]($groups -match 'S-1-16-(12288|16384)')",
+    ]).timeout(const Duration(seconds: 5));
+    return result.exitCode == 0 &&
+        result.stdout.toString().trim().toLowerCase() == 'true';
+  } on Object {
+    return false;
+  }
+}
+
 PermissionPreflight _checkMacosPermissions() {
   final euid = _effectiveUserId();
   final isRoot = euid == 0;
@@ -238,7 +266,7 @@ PermissionPreflight _checkLinuxPermissions() {
 }
 
 Future<PermissionPreflight> _checkWindowsPermissions() async {
-  final isAdmin = await _isWindowsAdministrator();
+  final isAdmin = await isWindowsElevatedToken();
   final wintun = _findWintunDll();
   final missingWintun = wintun == null;
   final needsElevation = !isAdmin && !missingWintun;
@@ -302,42 +330,6 @@ int? _effectiveUserId() {
     return int.tryParse(result.stdout.toString().trim());
   } catch (_) {
     return Platform.environment['USER'] == 'root' ? 0 : null;
-  }
-}
-
-Future<bool> _isWindowsAdministrator() async {
-  if (!Platform.isWindows) return false;
-  Process? process;
-  try {
-    final windir = Platform.environment['WINDIR']?.trim();
-    final executable = windir == null || windir.isEmpty
-        ? 'powershell.exe'
-        : '$windir\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-    process = await Process.start(executable, [
-      '-NoLogo',
-      '-NoProfile',
-      '-NonInteractive',
-      '-WindowStyle',
-      'Hidden',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-Command',
-      '[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
-    ], mode: ProcessStartMode.detachedWithStdio);
-    final output = await Future.wait<Object>([
-      process.stdout.transform(systemEncoding.decoder).join(),
-      process.stderr.transform(systemEncoding.decoder).join(),
-      process.exitCode,
-    ]).timeout(const Duration(seconds: 5));
-    return output[2] == 0 &&
-        (output[0] as String).trim().toLowerCase() == 'true';
-  } on TimeoutException {
-    try {
-      process?.kill();
-    } catch (_) {}
-    return false;
-  } catch (_) {
-    return false;
   }
 }
 

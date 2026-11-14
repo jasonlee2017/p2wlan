@@ -382,7 +382,7 @@ class DaemonController {
 
     final requiresElevation =
         Platform.isMacOS && !_isRootUser() ||
-        Platform.isWindows && !await _isWindowsAdministrator() ||
+        Platform.isWindows && !await _isWindowsElevated() ||
         Platform.isLinux && !_isRootUser();
     await startupTrace?.detail(
       'permission preflight requires_elevation=$requiresElevation',
@@ -733,6 +733,16 @@ class DaemonController {
       await deleteEphemeralLaunchTokenFile(tokenFile);
     } catch (_) {}
     if (!startup.ready) {
+      final healthFailure = _diagnosticsApi.healthFailureFor(
+        settings.diagnosticsUrl,
+      );
+      if (healthFailure != null) {
+        await startupTrace?.detail(
+          'health poll failure reason=${healthFailure.reasonCode ?? 'unknown'} '
+          'status=${healthFailure.statusCode ?? 'none'} '
+          'message=${healthFailure.message}',
+        );
+      }
       try {
         await _cleanupFailedStartup(launchPid);
       } catch (_) {}

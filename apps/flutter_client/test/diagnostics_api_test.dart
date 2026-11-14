@@ -156,6 +156,30 @@ void main() {
     expect(proxyRequests, 0);
   });
 
+  test('health probing reconnects after the daemon starts listening', () async {
+    final reservation = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    final port = reservation.port;
+    await reservation.close();
+
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final url = 'http://127.0.0.1:$port/status';
+
+    expect(await api.fetchHealth(url), isFalse);
+
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
+    addTearDown(() => server.close(force: true));
+    server.listen((request) async {
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..headers.contentType = ContentType.text
+        ..write('ok\n');
+      await request.response.close();
+    });
+
+    expect(await api.fetchHealth(url), isTrue);
+  });
+
   test('a timed-out diagnostics request aborts its socket', () async {
     final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(server.close);

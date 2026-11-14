@@ -66,15 +66,19 @@ class Control extends RoomApi {
 }
 
 class Diagnostics extends DiagnosticsApi {
+  bool unavailable = false;
   @override
   Future<bool> fetchHealth(String url) async => false;
   @override
-  Future<DiagnosticsSnapshot> fetchStatus(String url) async =>
-      DiagnosticsSnapshot.fromJson({
-        'network_id': room.id,
-        'node_id': 'local',
-        'virtual_ip': '10.21.1.2',
-      });
+  Future<DiagnosticsSnapshot> fetchStatus(String url) async {
+    if (unavailable) throw StateError('diagnostics unavailable');
+    return DiagnosticsSnapshot.fromJson({
+      'network_id': room.id,
+      'node_id': 'local',
+      'virtual_ip': '10.21.1.2',
+    });
+  }
+
   @override
   Future<RoutesResponse> verifyRoutes(String url) async => const RoutesResponse(
     contractVersion: 1,
@@ -90,6 +94,7 @@ class Daemon extends DaemonController {
   Daemon(Diagnostics api) : super(diagnosticsApi: api);
   int starts = 0, stops = 0;
   bool running = false;
+  bool exitOnStart = false;
   @override
   Future<bool> hasRoomRuntime() async => running;
   @override
@@ -103,7 +108,7 @@ class Daemon extends DaemonController {
   @override
   Future<DaemonCommandResult> start(AppSettings settings) async {
     starts++;
-    running = true;
+    running = !exitOnStart;
     return const DaemonCommandResult(ok: true, message: 'start');
   }
 
@@ -272,6 +277,19 @@ void main() {
       }
     },
   );
+  test('local daemon exit during auto start preserves retry intent', () async {
+    await manager.setAutoConnect(room, true);
+    daemon.exitOnStart = true;
+    api.unavailable = true;
+
+    final result = await manager.connect(room, automatic: true);
+
+    expect(result.ok, isFalse);
+    expect(manager.sessions, isEmpty);
+    final preference = await manager.connectionPreference(room);
+    expect(preference.autoConnect, isTrue);
+    expect(preference.wanted, isTrue);
+  });
   test(
     'recovering remotely disconnected live process stops it and clears intent',
     () async {

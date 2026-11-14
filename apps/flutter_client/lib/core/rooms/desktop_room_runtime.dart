@@ -105,7 +105,10 @@ class DesktopRoomRuntime implements RoomRuntime, RoomControlStatus {
     } catch (error, stackTrace) {
       if (error is RoomConnectionStopped) rethrow;
       if (error is DiagnosticsApiException && error.statusCode == 401) {
-        throw const RoomConnectionStopped('本机房间凭据已失效，连接已停止，请重新登录后重连');
+        throw const RoomConnectionStopped(
+          '本机房间凭据已失效，连接已停止，请重新登录后重连',
+          clearAutoConnectIntent: true,
+        );
       }
       try {
         if (!await exists()) {
@@ -116,6 +119,7 @@ class DesktopRoomRuntime implements RoomRuntime, RoomControlStatus {
             authenticationFailed
                 ? '服务端拒绝了本机设备凭据，房间连接已停止；请重新登录或联系管理员恢复设备授权'
                 : '本机房间服务已退出，连接已停止，请重新连接',
+            clearAutoConnectIntent: authenticationFailed,
           );
         }
       } on RoomConnectionStopped {
@@ -160,7 +164,10 @@ class DesktopRoomRuntime implements RoomRuntime, RoomControlStatus {
         'room_device_pending',
         'room_access',
       ].contains(error.code)) {
-        throw RoomConnectionStopped(error.message);
+        throw RoomConnectionStopped(
+          error.message,
+          clearAutoConnectIntent: true,
+        );
       }
       rethrow;
     } finally {
@@ -198,7 +205,7 @@ class DesktopRoomRuntime implements RoomRuntime, RoomControlStatus {
             'blocked' => '本机已被禁止连接此房间',
             'pending' => '本机正在等待房主审批',
             _ => '本机已被远程断开，请手动重新连接',
-          });
+          }, clearAutoConnectIntent: true);
         }
       }
       _controlWarning = null;
@@ -206,7 +213,10 @@ class DesktopRoomRuntime implements RoomRuntime, RoomControlStatus {
       rethrow;
     } on RoomException catch (error) {
       if (error.code == 'room_access') {
-        throw const RoomConnectionStopped('该账号已退出或被移出房间，本机连接已停止');
+        throw const RoomConnectionStopped(
+          '该账号已退出或被移出房间，本机连接已停止',
+          clearAutoConnectIntent: true,
+        );
       }
       _controlWarning = error.code == 'auth_expired'
           ? '登录已过期，暂时无法管理房间，请重新登录。'

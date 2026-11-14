@@ -467,13 +467,8 @@ extension DaemonControllerPids on DaemonController {
 
   String _shellQuote(String value) => "'${value.replaceAll("'", "'\\''")}'";
 
-  Future<bool> _isWindowsAdministrator() async {
-    if (!Platform.isWindows) return false;
-    final result = await _runWindowsPowerShell(
-      '[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
-    );
-    return result.exitCode == 0 &&
-        _equalsIgnoreCase(result.stdout.toString().trim(), 'true');
+  Future<bool> _isWindowsElevated() async {
+    return isWindowsElevatedToken();
   }
 
   @visibleForTesting
@@ -580,8 +575,6 @@ extension DaemonControllerPids on DaemonController {
     return '"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"';
   }
 
-  bool _equalsIgnoreCase(String left, String right) =>
-      left.toLowerCase() == right.toLowerCase();
 }
 
 /// Quote one argument using the Windows CRT command-line grammar. PowerShell
